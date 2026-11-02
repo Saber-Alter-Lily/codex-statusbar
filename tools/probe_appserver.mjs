@@ -1,6 +1,6 @@
 // Ground-truth probe: measure true delivered TPS from the real app-server event
 // stream (item/agentMessage/delta) and record the exact notification vocabulary
-// this Codex version emits. Read-only experiment: it starts its own app-server on
+// this Codex version emits. Live inference experiment (NOT read-only): starts its own app-server on
 // stdio and runs one ephemeral thread, so it never touches the desktop session.
 //
 // Usage: node tools/probe_appserver.mjs [--prompt "..."] [--seconds N]
@@ -16,6 +16,12 @@ const CODEX_BIN =
   path.join(os.homedir(), ".codex", "plugins", ".plugin-appserver", "codex.exe");
 
 const argv = process.argv.slice(2);
+// This is NOT read-only: it uses inherited credentials, sends prompts and may incur charges.
+if (!argv.includes("--allow-live-inference")) {
+  console.error("Blocked: live inference uses your credentials and may incur charges / save raw content. Review this script, then explicitly pass --allow-live-inference.");
+  process.exit(2);
+}
+
 const arg = (name, dflt) => {
   const i = argv.indexOf(name);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;

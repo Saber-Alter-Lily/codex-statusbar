@@ -55,7 +55,6 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private readonly DebugDiagnostics _debug;
     private readonly string? _forcedThreadId;
     private readonly GlobalHotkey _hotkey = new();
-    private readonly CodexThemeSource _codexTheme = new();
     private readonly ComposerDockTracker _dockTracker;
     private ComposerDockSnapshot _lastDock = ComposerDockSnapshot.Empty;
 
@@ -141,7 +140,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _settings = OverlaySettings.Load(_settingsPath);
 
         // "Start with Windows" is reconciled once per launch, here, in both modes. This is what makes
-        // the first run of this build opt in, and what upgrades a stale Run path after the exe moves.
+        // explicit consent control persistence, and repairs a stale Run path only after opt-in.
         ApplyStartupRegistration();
 
         _lifecycle = new LifecycleController(_debug);
@@ -637,7 +636,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             if (pair.Key == OverlayThemePreference.Auto)
             {
                 // Show what auto actually resolved to, so a mismatch is visible without opening the log.
-                pair.Value.Text = $"Auto  ·  跟随 Codex ({( _effectiveTheme == OverlayThemeKind.Light ? "Light" : "Dark")}" +
+                pair.Value.Text = $"Auto  ·  跟随 Windows ({( _effectiveTheme == OverlayThemeKind.Light ? "Light" : "Dark")}" +
                     $"，来源 {_effectiveThemeSource})";
             }
         }
@@ -676,8 +675,8 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     }
 
     /// <summary>
-    /// Reconciles <c>HKCU\...\Run</c> with the settings once per launch. The first launch of a build
-    /// that has this feature opts in; every later launch only enforces what the user chose, and
+    /// Reconciles <c>HKCU\...\Run</c> with explicit consent once per launch. First launch stays off;
+    /// legacy auto-enablement is not treated as consent. After an opt-in, it
     /// repairs the registered path if the exe has moved.
     /// </summary>
     private void ApplyStartupRegistration()
@@ -692,7 +691,6 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         var result = StartupCoordinator.Apply(_settings, _executablePath, out var changed);
         _startupRegistryEnabled = result.RegistryEnabled;
         _startupOutcome = "startup registration: " + result.Outcome
-            + (result.FirstRunOptIn ? " (first run; on by default, the tray can turn it off)" : string.Empty)
             + (result.Error is { Length: > 0 } error ? " — " + error : string.Empty);
         if (changed)
         {
@@ -2466,36 +2464,19 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         ApplyEffectiveTheme();
     }
 
-    /// <summary>
-    /// Resolves the effective palette. <c>Auto</c> follows <b>Codex's own</b> appearance setting, falling
-    /// back to the Windows app theme only when Codex has not recorded one; <c>Dark</c> / <c>Light</c>
-    /// force the text colours outright.
-    /// </summary>
+    /// <summary>Auto follows Windows; manual Dark/Light overrides never read Codex configuration.</summary>
     private void ApplyEffectiveTheme()
     {
-        var codexKind = _codexTheme.Current;
         var kind = _settings.ThemePreference switch
         {
             OverlayThemePreference.Dark => OverlayThemeKind.Dark,
             OverlayThemePreference.Light => OverlayThemeKind.Light,
-            _ => codexKind switch
-            {
-                CodexThemeKind.Light => OverlayThemeKind.Light,
-                CodexThemeKind.Dark => OverlayThemeKind.Dark,
-                _ => _autoThemePalette == OverlayThemePalette.For(OverlayThemeKind.Light)
-                    ? OverlayThemeKind.Light
-                    : OverlayThemeKind.Dark
-            }
+            _ => _autoThemePalette == OverlayThemePalette.For(OverlayThemeKind.Light)
+                ? OverlayThemeKind.Light : OverlayThemeKind.Dark
         };
-
         _effectiveTheme = kind;
         _effectiveThemeSource = _settings.ThemePreference != OverlayThemePreference.Auto
-            ? "forced"
-            : codexKind switch
-            {
-                CodexThemeKind.Light or CodexThemeKind.Dark => "Codex config",
-                _ => "Windows"
-            };
+            ? "forced" : "Windows";
 
         var palette = OverlayThemePalette.For(kind);
         _form.ApplyTheme(palette);
@@ -2503,7 +2484,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         UpdateManualMenuState();
     }
 
-    /// <summary>Re-reads Codex's appearance setting and re-applies if it changed.</summary>
+    /// <summary>Re-applies the Windows/manual appearance if it changed.</summary>
     private void RefreshEffectiveTheme()
     {
         var previous = _effectiveTheme;

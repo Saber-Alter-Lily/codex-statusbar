@@ -108,7 +108,7 @@ internal static class OverlayPresentationBuilder
                 visibleFields,
                 primaryField,
                 secondaryField,
-                field => CreateMetric(snapshot, field, contextPercent)),
+                field => CreateMetric(snapshot, field, contextPercent), snapshot.TtftMs),
             contextPercent,
             (visibleFields & DisplayField.ContextPercent) != 0,
             null,
@@ -158,7 +158,7 @@ internal static class OverlayPresentationBuilder
             DisplayField.ContextPercent => "上下文百分比",
             DisplayField.Reasoning => "推理输出",
             DisplayField.Thread => "会话 ID",
-            DisplayField.Tps => "输出速度 TPS",
+            DisplayField.Tps => "模型阶段估算 TPS（含推理）",
             _ => throw new ArgumentOutOfRangeException(nameof(field), field, "不支持的展示字段。")
         };
     }
@@ -198,13 +198,24 @@ internal static class OverlayPresentationBuilder
         DisplayField visibleFields,
         DisplayField primaryField,
         DisplayField secondaryField,
-        Func<DisplayField, OverlayMetric> createMetric)
+        Func<DisplayField, OverlayMetric> createMetric,
+        double? ttftMs = null)
     {
         return DisplayFieldRules.Ordered
             .Where(field => (visibleFields & field) != 0)
             .Where(field => field != primaryField && field != secondaryField)
             .Select(createMetric)
+            .Append(CreateTtftRow(ttftMs))
             .ToArray();
+    }
+
+    // Informational detail row only: no new persisted field/selection or compact-strip width.
+    internal static OverlayMetric CreateTtftRow(double? milliseconds)
+    {
+        var reported = milliseconds is double value && double.IsFinite(value) && value >= 0;
+        return new OverlayMetric(DisplayField.None, "TTFT", "TTFT（上报值）",
+            reported ? milliseconds!.Value.ToString("0.##", CultureInfo.InvariantCulture) + " ms"
+                : "--（未上报）", reported);
     }
 
     private static OverlayMetric CreateWaitingMetric(DisplayField field)
@@ -252,7 +263,7 @@ internal static class OverlayPresentationBuilder
             DisplayField.ContextPercent => ("上下文", "上下文占用"),
             DisplayField.Reasoning => ("推理", "推理输出"),
             DisplayField.Thread => ("会话", "会话"),
-            DisplayField.Tps => ("⚡", "输出速度"),
+            DisplayField.Tps => ("⚡", "模型阶段估算（含推理）"),
             _ => throw new ArgumentOutOfRangeException(nameof(field), field, "不支持的展示字段。")
         };
     }

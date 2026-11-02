@@ -485,7 +485,7 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
                 or InvalidDataException or JsonException or InvalidOperationException or TimeoutException)
             {
-                FrameObserver?.Invoke("error " + exception.GetType().Name + ": " + exception.Message);
+                FrameObserver?.Invoke("error " + exception.GetType().Name);
                 MarkDisconnected(exception.Message);
             }
 
@@ -526,7 +526,7 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
 
     private void ProcessFrame(byte[] payload)
     {
-        FrameObserver?.Invoke("recv " + Encoding.UTF8.GetString(payload));
+        FrameObserver?.Invoke("frame received (payload redacted)");
         using var document = JsonDocument.Parse(payload);
         var root = document.RootElement;
         if (!root.TryGetProperty("type", out var type)
@@ -948,7 +948,13 @@ internal sealed class TokenLogMonitor : IDisposable
 
         try
         {
-            return Directory.EnumerateFiles(_sessionRoot, $"*{threadId}.jsonl", SearchOption.AllDirectories)
+            return Directory.EnumerateFiles(_sessionRoot, $"*{threadId}.jsonl", new EnumerationOptions
+                {
+                    RecurseSubdirectories = true,
+                    AttributesToSkip = FileAttributes.ReparsePoint,
+                    IgnoreInaccessible = true
+                })
+                .Where(IsAllowedRolloutPath)
                 .Where(path => !requireDesktopRoot || IsRootDesktopSession(path))
                 .OrderByDescending(SafeGetLastWriteUtc)
                 .FirstOrDefault();
@@ -978,14 +984,70 @@ internal sealed class TokenLogMonitor : IDisposable
             return;
         }
 
-        var path = !string.IsNullOrWhiteSpace(record.RolloutPath) && File.Exists(record.RolloutPath)
-            ? record.RolloutPath
+        var path = !string.IsNullOrWhiteSpace(record.RolloutPath)
+            && IsAllowedRolloutPath(record.RolloutPath)
+            ? Path.GetFullPath(record.RolloutPath)
             : FindRolloutPath(record.Id);
         SwitchActiveLog(path, record.Id, "sqlite-fallback", record);
     }
 
+    /// <summary>Database paths are untrusted; only regular files inside this sessions root qualify.</summary>
+    private bool IsAllowedRolloutPath(string path)
+    {
+        try
+        {
+            if (!Path.IsPathFullyQualified(path))
+            {
+                return false;
+            }
+
+            var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_sessionRoot));
+            var candidate = Path.GetFullPath(path);
+            var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
+            if (!candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                || !candidate.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)
+                || !File.Exists(candidate))
+            {
+                return false;
+            }
+
+            // Lexical containment alone does not stop junction/symlink escapes. Reject reparse
+            // points at every component, including the configured root. This is not a defense
+            // against a same-user process racing filesystem changes after validation.
+            var current = candidate;
+            while (true)
+            {
+                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                {
+                    return false;
+                }
+
+                if (string.Equals(current, root, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                current = Path.GetDirectoryName(current)!;
+                if (string.IsNullOrEmpty(current))
+                {
+                    return false;
+                }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
     private bool IsRootDesktopSession(string path)
     {
+        if (!IsAllowedRolloutPath(path))
+        {
+            return false;
+        }
+
         if (_rootSessionCache.ContainsKey(path))
         {
             return true;
@@ -1293,6 +1355,9 @@ internal static class HeadlessRunner
         if (!ReferenceEquals(snapshot, previous))
         {
             diagnostics.Write(snapshot);
+            Console.Out.WriteLine("Model-stage TPS estimate (includes reasoning; not per-token): "
+                + MetricFormat.FormatTpsFloat(snapshot?.Tps)
+                + " tok/s | TTFT ms: " + DebugDiagnostics.FormatTtft(snapshot?.TtftMs));
         }
 
         return snapshot;

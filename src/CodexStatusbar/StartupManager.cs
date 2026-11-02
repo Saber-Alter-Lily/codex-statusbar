@@ -161,9 +161,8 @@ internal readonly record struct StartupStatus(
         string? registeredCommand,
         string executablePath)
     {
-        // First run of a build that has this feature: opt in once. After that the user's choice is
-        // the only thing that matters — an upgrade must never silently re-enable what they turned off.
-        var desired = configured ? startWithWindows : true;
+        // Never infer consent from first launch. Only explicit settings enable startup.
+        var desired = configured && startWithWindows;
 
         if (!desired)
         {
@@ -202,19 +201,17 @@ internal readonly record struct StartupApplyResult(
 /// Keeps three things in agreement: the user's intent in <c>settings.json</c>, the state they can see
 /// in the tray, and the <c>HKCU\...\Run</c> value Windows will actually use.
 ///
-/// <para>The first-run rule lives here and only here: a build that has this feature opts in once, on
-/// its first launch, and never again. That is why the decision needs both flags — "never configured"
-/// and "the user turned it off" are the same <c>false</c> in
-/// <see cref="OverlaySettings.StartWithWindows"/>.</para>
+/// <para>Upstream auto-enabled settings are not consent: this fork requires a separate
+/// explicit opt-in marker, set only by the tray toggle or install-startup command.</para>
 /// </summary>
 internal static class StartupCoordinator
 {
     /// <summary>Reconciles the registry with the settings. Called once per launch, in both modes.</summary>
     public static StartupApplyResult Apply(OverlaySettings settings, string executablePath, out bool settingsChanged)
     {
-        var configured = settings.StartupConfigured;
-        var desired = configured ? settings.StartWithWindows : true;
-        var firstRun = !configured;
+        var configured = settings.StartupConfigured && settings.StartupOptInConfirmed;
+        var desired = configured && settings.StartWithWindows;
+        var firstRun = !settings.StartupConfigured;
         var registered = StartupManager.Read();
         var action = StartupStatus.ResolveAction(configured, settings.StartWithWindows, registered, executablePath);
 
@@ -222,7 +219,7 @@ internal static class StartupCoordinator
         var outcome = action switch
         {
             StartupRegistryAction.Enable => StartupManager.Enable(executablePath, out error)
-                ? "enabled (first run)"
+                ? "enabled (explicit opt-in)"
                 : "enable failed",
             StartupRegistryAction.RepairPath => StartupManager.Enable(executablePath, out error)
                 ? "enabled (path repaired)"
@@ -240,7 +237,7 @@ internal static class StartupCoordinator
         settings.StartWithWindows = desired;
         settings.StartupConfigured = true;
 
-        return new StartupApplyResult(effective, firstRun, outcome, error);
+        return new StartupApplyResult(effective, false, outcome, error);
     }
 
     /// <summary>The tray toggle. Marks the setting as configured so no later launch re-enables it.</summary>
@@ -254,6 +251,7 @@ internal static class StartupCoordinator
             ? StartupManager.Enable(executablePath, out error)
             : StartupManager.Disable(out error);
 
+        settings.StartupOptInConfirmed = enabled;
         settings.StartWithWindows = enabled;
         settings.StartupConfigured = true;
         var effective = StartupManager.Read() is not null;

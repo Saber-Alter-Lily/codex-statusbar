@@ -43,3 +43,6 @@ docs/app-server-schema/
 
 # ---------------------------------------- reference clones fetched in research
 ../_repos/
+# Local diagnostics may contain private content; do not commit generated probe output.
+docs/probe-*.jsonl
+docs/evidence/groundtruth-tps*.json

@@ -150,6 +150,7 @@ internal sealed class OverlaySettings
         // --- v4: lifecycle / start with Windows ---
         public bool? StartWithWindows { get; set; }
         public bool? StartupConfigured { get; set; }
+        public bool? StartupOptInConfirmed { get; set; }
 
         // --- v1 layout keys, still written for backward compatibility ---
         public int? AnchorMode { get; set; }
@@ -217,9 +218,11 @@ internal sealed class OverlaySettings
     /// <summary>
     /// Whether the first-run default has already been applied. Kept separately from
     /// <see cref="StartWithWindows"/> because "never configured" and "explicitly turned off" both
-    /// read as <c>false</c>, and only the former may be opted in on the user's behalf.
+    /// read as <c>false</c>, neither permits automatic opt-in.
     /// </summary>
     public bool StartupConfigured { get; set; }
+
+    public bool StartupOptInConfirmed { get; set; }
 
     public static OverlaySettings CreateDefault()
     {
@@ -321,12 +324,10 @@ internal sealed class OverlaySettings
                 persisted.FixedScreenX ?? 0,
                 persisted.FixedScreenY ?? 0);
 
-            // v4: lifecycle. Both fields stay as written; the first-run opt-in is applied by
-            // StartupCoordinator at launch, which is the only place that can also see the registry.
-            // An absent `startupConfigured` means "never configured", including for a v3 file being
-            // upgraded — and that is exactly the case that gets the default-on treatment once.
+            // Legacy startup preferences require fresh explicit consent in this fork.
             settings.StartWithWindows = persisted.StartWithWindows ?? false;
             settings.StartupConfigured = persisted.StartupConfigured ?? false;
+            settings.StartupOptInConfirmed = persisted.StartupOptInConfirmed ?? false;
 
             // Migration. A v2 file always wrote `positionMode`, and v2's default was FollowCodex, so
             // an explicit choice of FollowCodex is indistinguishable from never having touched it.
@@ -373,6 +374,7 @@ internal sealed class OverlaySettings
             // v4: lifecycle.
             StartWithWindows = StartWithWindows,
             StartupConfigured = StartupConfigured,
+            StartupOptInConfirmed = StartupOptInConfirmed,
 
             // v1 keys, kept so an older build can still read this file.
             AnchorMode = (int)SanitizeAnchorMode((int)AnchorMode),

@@ -39,14 +39,15 @@ if (-not $SkipTest) {
             Write-Warning "Ctrl+Alt+Shift+P could not be registered (another app may own it); the tray menu still works"
         }
     } else {
-        Write-Warning "self-test binary not found at $exe"
+        throw "self-test binary not found at $exe"
     }
 
     Write-Host "`n== fixture expectations ==" -ForegroundColor Cyan
     if (Get-Command python -ErrorAction SilentlyContinue) {
         python (Join-Path $root 'tools\make_fixtures.py')
+        if ($LASTEXITCODE -ne 0) { throw "fixture checks failed ($LASTEXITCODE)" }
     } else {
-        Write-Warning "python not found; skipped fixture checks"
+        throw "python not found; fixture checks cannot run (use -SkipTest explicitly for an unverified build)"
     }
 }
 

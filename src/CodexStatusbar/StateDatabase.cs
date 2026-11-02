@@ -46,16 +46,13 @@ internal static class StateDatabase
     {
         if (!string.IsNullOrWhiteSpace(sessionsRoot))
         {
-            var home = Path.GetDirectoryName(sessionsRoot.TrimEnd(
-                Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            if (!string.IsNullOrWhiteSpace(home))
-            {
-                var candidate = Path.Combine(home, "state_5.sqlite");
-                if (File.Exists(candidate))
-                {
-                    return candidate;
-                }
-            }
+            // A missing isolated database must remain missing: never consult another profile.
+            // A filesystem root has no sibling database, so disable the fallback with an empty path.
+            var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sessionsRoot));
+            var home = Path.GetDirectoryName(normalized);
+            return string.IsNullOrWhiteSpace(home)
+                ? string.Empty
+                : Path.Combine(home, "state_5.sqlite");
         }
 
         return ResolvePath();

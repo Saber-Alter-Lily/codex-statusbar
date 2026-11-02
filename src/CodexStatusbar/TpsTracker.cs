@@ -331,6 +331,7 @@ internal sealed class TpsTracker
         // of lagging behind the previous one, while jitter inside a turn is still damped.
         _ema = null;
         SmoothedTps = null;
+        TtftMs = null; // Never show the preceding turn's latency as this turn's.
         Streaming = true;
     }
 
@@ -537,10 +538,7 @@ internal sealed class TpsTracker
             LastTurnDurationMs = durationMs;
         }
 
-        if (ttftMs is not null)
-        {
-            TtftMs = ttftMs;
-        }
+        TtftMs = ttftMs is >= 0 ? ttftMs : null;
 
         Streaming = false;
         LastTurnTps = SmoothedTps;

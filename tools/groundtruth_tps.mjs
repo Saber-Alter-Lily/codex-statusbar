@@ -24,6 +24,12 @@ import os from "node:os";
 import fs from "node:fs";
 
 const argv = process.argv.slice(2);
+// This is NOT read-only: it uses inherited credentials, sends prompts and may incur charges.
+if (!argv.includes("--allow-live-inference")) {
+  console.error("Blocked: live inference uses your credentials and may incur charges / save raw content. Review this script, then explicitly pass --allow-live-inference.");
+  process.exit(2);
+}
+
 const arg = (name, dflt) => {
   const i = argv.indexOf(name);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : dflt;

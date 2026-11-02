@@ -127,24 +127,6 @@ internal static class ProbeRunner
             return true;
         }
 
-        // IPC 探针用于验证 Codex 当前可见任务广播，不启动悬浮条。
-        if (args.Count >= 2 && args[0].Equals("--ipc-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            using var routeMonitor = new CodexIpcActiveThreadMonitor();
-            routeMonitor.Start();
-            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
-            ActiveThreadRouteStatus status;
-            do
-            {
-                Thread.Sleep(100);
-                status = routeMonitor.GetStatus();
-            }
-            while (DateTime.UtcNow < deadline && string.IsNullOrWhiteSpace(status.ThreadId));
-
-            WriteJson(args[1], status);
-            return true;
-        }
-
         // 窗口探针用于验证当前交互桌面可见的 Codex 顶层窗口信息。
         if (args.Count >= 2 && args[0].Equals("--window-probe", StringComparison.OrdinalIgnoreCase))
         {
@@ -189,14 +171,14 @@ internal static class ProbeRunner
     }
 
     /// <summary>
-    /// <c>--ipc-probe [seconds]</c>: connects to <c>\\.\pipe\codex-ipc</c> and prints every lifecycle
-    /// event and frame, then the resolved active-thread status. This is the diagnostic to run when
+    /// <c>--ipc-probe [seconds]</c>: connects to <c>\\.\pipe\codex-ipc</c> and prints only redacted connection
+    /// and resolution status, never message bodies or thread identifiers. This is the diagnostic to run when
     /// Codex is updated and the strip stops following the open conversation.
     /// </summary>
     private static int RunIpcProbe(int seconds)
     {
         Console.Out.WriteLine($"connecting to \\\\.\\pipe\\codex-ipc for {seconds}s ...");
-        CodexIpcActiveThreadMonitor.FrameObserver = line => Console.Out.WriteLine("  [ipc] " + line);
+        // No raw-frame observer: IPC payloads can contain conversation content and secrets.
 
         try
         {
@@ -211,11 +193,11 @@ internal static class ProbeRunner
             var status = monitor.GetStatus();
             Console.Out.WriteLine();
             Console.Out.WriteLine("resolved status:");
-            Console.Out.WriteLine($"  threadId          = {status.ThreadId ?? "<null>"}");
+            Console.Out.WriteLine($"  threadId          = {(string.IsNullOrWhiteSpace(status.ThreadId) ? "<absent>" : "<redacted>")}");
             Console.Out.WriteLine($"  isConnected       = {status.IsConnected}");
             Console.Out.WriteLine($"  activeWindowCount = {status.ActiveWindowCount}");
             Console.Out.WriteLine($"  version           = {status.Version}");
-            Console.Out.WriteLine($"  lastError         = {status.LastError ?? "<none>"}");
+            Console.Out.WriteLine($"  lastError         = {(status.LastError is null ? "<none>" : "<redacted>")}");
             var ok = !string.IsNullOrWhiteSpace(status.ThreadId);
             Console.Out.WriteLine(ok
                 ? "RESULT: PASS (a conversation was resolved over IPC)"
@@ -224,7 +206,7 @@ internal static class ProbeRunner
         }
         catch (Exception exception)
         {
-            Console.Out.WriteLine("RESULT: FAIL " + exception);
+            Console.Out.WriteLine("RESULT: FAIL " + exception.GetType().Name);
             return 1;
         }
         finally
