@@ -728,7 +728,6 @@ internal sealed class TokenLogMonitor : IDisposable
     private readonly string _stateDatabasePath;
     private readonly FileSystemWatcher? _watcher;
     private readonly ConcurrentQueue<string> _changedPaths = new();
-    private readonly ConcurrentDictionary<string, bool> _rootSessionCache = new(StringComparer.OrdinalIgnoreCase);
 
     private RolloutReader? _reader;
     private StateThreadRecord? _stateRecord;
@@ -748,6 +747,7 @@ internal sealed class TokenLogMonitor : IDisposable
     public TokenLogMonitor(string? sessionRoot = null, string? stateDatabasePath = null)
     {
         _sessionRoot = sessionRoot ?? SessionPathResolver.Resolve();
+        RecentSessions = new RecentSessionMonitor(_sessionRoot);
         _stateDatabasePath = stateDatabasePath ?? StateDatabase.ResolvePathForSessionsRoot(_sessionRoot);
 
         if (!Directory.Exists(_sessionRoot))
@@ -764,8 +764,11 @@ internal sealed class TokenLogMonitor : IDisposable
         };
         _watcher.Changed += OnLogChanged;
         _watcher.Created += OnLogChanged;
-        _watcher.Renamed += (_, eventArgs) => _changedPaths.Enqueue(eventArgs.FullPath);
+        _watcher.Renamed += (_, eventArgs) => OnPathChanged(eventArgs.FullPath);
+        _watcher.Error += (_, _) => RecentSessions.MarkDiscoveryIncomplete();
     }
+
+    public RecentSessionMonitor RecentSessions { get; }
 
     public long ActiveSessionVersion { get; private set; }
 
@@ -820,7 +823,9 @@ internal sealed class TokenLogMonitor : IDisposable
         EnsureReader();
         RefreshReader();
 
-        return BuildSnapshot();
+        var snapshot = BuildSnapshot();
+        RecentSessions.Poll(_readerPath, _selectedThreadId);
+        return snapshot;
     }
 
     /// <summary>Reads only newly appended bytes; re-seeds from the tail when the file was replaced.</summary>
@@ -865,7 +870,7 @@ internal sealed class TokenLogMonitor : IDisposable
 
         try
         {
-            _reader = new RolloutReader(path);
+            _reader = new RolloutReader(path, maxTailBytes: TpsRules.TailReadBytes);
             _reader.Initialize();
             if (_reader.TailWasExtended)
             {
@@ -893,7 +898,13 @@ internal sealed class TokenLogMonitor : IDisposable
         }
     }
 
-    private void OnLogChanged(object sender, FileSystemEventArgs eventArgs) => _changedPaths.Enqueue(eventArgs.FullPath);
+    private void OnLogChanged(object sender, FileSystemEventArgs eventArgs) => OnPathChanged(eventArgs.FullPath);
+
+    private void OnPathChanged(string path)
+    {
+        if (_changedPaths.Count < RecentSessionMonitor.MaximumPendingPaths) _changedPaths.Enqueue(path);
+        RecentSessions.ObservePath(path);
+    }
 
     private void DrainChangedPaths()
     {
@@ -991,114 +1002,10 @@ internal sealed class TokenLogMonitor : IDisposable
         SwitchActiveLog(path, record.Id, "sqlite-fallback", record);
     }
 
-    /// <summary>Database paths are untrusted; only regular files inside this sessions root qualify.</summary>
-    private bool IsAllowedRolloutPath(string path)
-    {
-        try
-        {
-            if (!Path.IsPathFullyQualified(path))
-            {
-                return false;
-            }
+    private bool IsAllowedRolloutPath(string path) => RolloutPathPolicy.IsAllowed(_sessionRoot, path);
 
-            var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_sessionRoot));
-            var candidate = Path.GetFullPath(path);
-            var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
-            if (!candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-                || !candidate.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)
-                || !File.Exists(candidate))
-            {
-                return false;
-            }
-
-            // Lexical containment alone does not stop junction/symlink escapes. Reject reparse
-            // points at every component, including the configured root. This is not a defense
-            // against a same-user process racing filesystem changes after validation.
-            var current = candidate;
-            while (true)
-            {
-                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
-                {
-                    return false;
-                }
-
-                if (string.Equals(current, root, StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-
-                current = Path.GetDirectoryName(current)!;
-                if (string.IsNullOrEmpty(current))
-                {
-                    return false;
-                }
-            }
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
-            or ArgumentException or NotSupportedException)
-        {
-            return false;
-        }
-    }
-
-    private bool IsRootDesktopSession(string path)
-    {
-        if (!IsAllowedRolloutPath(path))
-        {
-            return false;
-        }
-
-        if (_rootSessionCache.ContainsKey(path))
-        {
-            return true;
-        }
-
-        try
-        {
-            using var stream = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(
-                stream,
-                Encoding.UTF8,
-                detectEncodingFromByteOrderMarks: true,
-                bufferSize: 64 * 1024);
-            var firstLine = reader.ReadLine();
-            if (string.IsNullOrWhiteSpace(firstLine))
-            {
-                // A Created event can land before Codex writes the first line; do not cache the miss.
-                return false;
-            }
-
-            using var document = JsonDocument.Parse(firstLine);
-            var root = document.RootElement;
-            if (!root.TryGetProperty("type", out var type) || type.GetString() != "session_meta"
-                || !root.TryGetProperty("payload", out var payload))
-            {
-                return false;
-            }
-
-            // Sub-agent rollouts replay the parent's session, so ONLY the first physical line is
-            // authoritative. Desktop root sessions carry originator == "Codex Desktop"; their source
-            // field is "vscode" for Desktop too, so nothing else may be required.
-            if (!payload.TryGetProperty("originator", out var originator)
-                || originator.ValueKind != JsonValueKind.String
-                || !string.Equals(originator.GetString(), "Codex Desktop", StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            _rootSessionCache[path] = true;
-            return true;
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
-            or JsonException)
-        {
-            return false;
-        }
-    }
+    private bool IsRootDesktopSession(string path) =>
+        IsAllowedRolloutPath(path) && RecentSessionMonitor.TryReadDesktopId(path, out _);
 
     private void SwitchActiveLog(string? path, string? threadId, string source, StateThreadRecord? record = null)
     {

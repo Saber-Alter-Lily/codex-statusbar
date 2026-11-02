@@ -106,6 +106,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private ManualPlacementSnapshot? _settingsSnapshotBeforeEdit;
     private bool _saveFailureNotified;
     private TokenSnapshot? _lastSnapshot;
+    private ToolStripMenuItem _recentSessionsMenu = null!;
+    private ToolStripMenuItem _recentSessionsCoverage = null!;
+    private readonly ToolStripMenuItem[] _recentSessionRows = new ToolStripMenuItem[RecentSessionMonitor.MaximumSessions];
+
     private bool _manuallyHidden;
     private int _pollInFlight;
     private int _disposed;
@@ -188,6 +192,17 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
 
         _sessionMenuItem = new ToolStripMenuItem("会话：等待数据") { Enabled = false };
         menu.Items.Add(_sessionMenuItem);
+        _recentSessionsMenu = new ToolStripMenuItem("多会话速度 · 近期观察（最多8条）");
+        _recentSessionsCoverage = new ToolStripMenuItem("仅当前及启动后变化；非全部历史会话") { Enabled = false };
+        _recentSessionsMenu.DropDownItems.Add(_recentSessionsCoverage);
+        _recentSessionsMenu.DropDownItems.Add(new ToolStripSeparator());
+        for (var index = 0; index < _recentSessionRows.Length; index++)
+        {
+            _recentSessionRows[index] = new ToolStripMenuItem("等待日志") { Enabled = false, Visible = index == 0 };
+            _recentSessionsMenu.DropDownItems.Add(_recentSessionRows[index]);
+        }
+        menu.Items.Add(_recentSessionsMenu);
+
         _pinSessionMenuItem = new ToolStripMenuItem("锁定当前会话") { Enabled = false, CheckOnClick = true };
         _pinSessionMenuItem.CheckedChanged += (_, _) =>
         {
@@ -789,6 +804,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _routeMonitor.Stop();
         _monitor?.Dispose();
         _monitor = null;
+        UpdateRecentSessionMenu([], false);
         CollapseAndHide();
         _currentTarget = null;
         _lastDock = ComposerDockSnapshot.Empty;
@@ -1477,18 +1493,22 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
                     Snapshot: snapshot,
                     Version: monitor.ActiveSessionVersion,
                     ThreadId: monitor.ActiveThreadId,
-                    RouteStatus: routeStatus);
+                    RouteStatus: routeStatus,
+                    RecentSessions: monitor.RecentSessions.Latest,
+                    DiscoveryIncomplete: monitor.RecentSessions.DiscoveryIncomplete);
             })
             .ContinueWith(task =>
             {
                 try
                 {
-                    if (Volatile.Read(ref _disposed) == 0 && task.Status == TaskStatus.RanToCompletion)
+                    if (Volatile.Read(ref _disposed) == 0 && ReferenceEquals(monitor, _monitor)
+                        && task.Status == TaskStatus.RanToCompletion)
                     {
                         _pendingSnapshot = task.Result.Snapshot;
                         _pendingSessionVersion = task.Result.Version;
                         _pendingThreadId = task.Result.ThreadId;
                         _pendingRouteStatus = task.Result.RouteStatus;
+                        UpdateRecentSessionMenu(task.Result.RecentSessions, task.Result.DiscoveryIncomplete);
                     }
                 }
                 finally
@@ -1496,6 +1516,19 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
                     Interlocked.Exchange(ref _pollInFlight, 0);
                 }
             }, CancellationToken.None, TaskContinuationOptions.None, uiScheduler);
+    }
+
+    private void UpdateRecentSessionMenu(IReadOnlyList<RecentSessionMetric> rows, bool discoveryIncomplete)
+    {
+        _recentSessionsCoverage.Text = discoveryIncomplete
+            ? "发现队列溢出：可能漏会话；仅当前及启动后变化"
+            : "仅当前及启动后变化；非全部历史；15秒无新记录隐藏TPS";
+        for (var index = 0; index < _recentSessionRows.Length; index++)
+        {
+            var item = _recentSessionRows[index];
+            item.Visible = index < rows.Count || index == 0;
+            item.Text = index < rows.Count ? rows[index].MenuText : "等待可读会话日志（不补猜速度）";
+        }
     }
 
     private void RefreshPresentation()

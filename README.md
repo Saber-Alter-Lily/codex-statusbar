@@ -11,6 +11,15 @@ The expanded details and headless output also show reported time to first token 
 security certification or verified binary release. Upstream test results and performance
 claims must not be treated as validation of this fork.
 
+## Recent-session monitoring (source implementation)
+
+The tray now includes a recent-session list for up to eight independently tracked
+conversations, showing a local short identifier, model-stage TPS estimate, reported
+TTFT and state. It discovers the selected conversation and log changes observed since
+startup, **not all historical conversations**. Speeds are never added together; stale
+or missing data is not presented as live speed. This UI and its synthetic C# tests have
+not yet been run. See the [phase-two report](docs/MULTI_SESSION_PHASE2.zh-CN.md).
+
 ## What changed
 
 - Windows startup is off by default and requires explicit consent. An upstream
@@ -89,7 +98,8 @@ Source-only regression guards, JavaScript syntax checks and diff whitespace chec
 No .NET build, C# self-test, Windows UI, registry migration or live IPC test has run.
 The new TTFT detail row still needs visual and behavioral validation.
 
-Outstanding work includes strict resource limits for unusually large session logs,
+Selected and background readers now have bounded read windows; outstanding work includes
+whole-process resource limits and behavioral validation of unusually large session logs,
 audit of additional developer probes, filesystem race handling and release-chain review.
 Normal diagnostic redaction does not sanitize previously generated files or repository history.
 

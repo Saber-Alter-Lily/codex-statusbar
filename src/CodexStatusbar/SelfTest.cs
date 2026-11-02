@@ -71,6 +71,10 @@ internal static class SelfTest
         Section("privacy and TTFT regressions");
         RunHardeningRules();
 
+        Section("bounded readers and recent-session isolation (synthetic files only)");
+        foreach (var check in BoundedReaderSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in RecentSessionSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+
         Section("TPS state machine");
         RunStateMachine(stdout);
 
