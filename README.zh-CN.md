@@ -6,8 +6,8 @@
 为 Windows 上的 Codex Desktop 提供状态浮条：显示 token 总量、缓存命中信息和模型阶段速度估算；
 展开详情与无界面终端输出还显示上游上报的首 token 时间（TTFT）。
 
-**Windows 编译及合成自测已通过：326 项检查，0 失败。**
-这只验证对应源码版本，不代表真实 Codex 接入或 UI 已验收；没有安全认证或二进制发行版。详见[验证记录](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md)。
+**Windows 编译及合成自测已通过：源码和最终免安装 EXE 各 434 项检查，0 失败。**
+这只验证对应源码版本，不代表真实 Codex 接入或 UI 已验收；没有安全认证或正式 Release。详见[最新验证记录](docs/AUDIT_FIXES.zh-CN.md)。
 
 ## 多会话监测
 
@@ -80,7 +80,7 @@ pwsh -File build.ps1
 ## 验证与限制
 
 已通过源码回退守卫、JavaScript 语法检查及 diff 空白检查。
-对应源码版本已在 Windows Server 2025、.NET SDK 10.0.403 上编译，0 警告、0 错误，326 项合成自测全部通过；具体提交及日志见[验证记录](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md)。
+对应源码版本已在 Windows Server 2025、.NET SDK 10.0.403 上编译，0 警告、0 错误，源码与最终 EXE 各 434 项合成自测全部通过；具体提交及日志见[验证记录](docs/AUDIT_FIXES.zh-CN.md)。
 尚未验证真实 Codex 客户端接入、UI、实际注册表迁移或真实 IPC；TTFT 详情行仍需视觉与行为验收。
 
 选中会话及后台 reader 已采用有界读取窗口；仍需验证超大日志行为、全进程资源预算、文件系统竞争条件、实际桌面行为及平台兼容性。

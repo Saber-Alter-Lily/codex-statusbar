@@ -7,9 +7,9 @@ A Windows companion status strip for Codex Desktop, derived from
 It displays token totals, cache-hit information and a model-stage speed estimate.
 The expanded details and headless output also show reported time to first token (TTFT).
 
-**Windows build and synthetic self-tests passed: 326 checks, zero failures.**
+**Windows build and synthetic self-tests passed: 434 checks, zero failures, including the final portable EXE.**
 This validates the tested source revision, not live Codex integration or the UI. There is
-no security certification or binary release. See the [validation record](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md).
+no security certification or formal Release. See the [latest validation record](docs/AUDIT_FIXES.zh-CN.md).
 
 ## Recent-session monitoring
 
@@ -111,7 +111,7 @@ this is not a guarantee that only counters enter the process.
 
 Source-only regression guards, JavaScript syntax checks and diff whitespace checks passed.
 On Windows Server 2025 with .NET SDK 10.0.403, the tested revision built with zero warnings
-and zero errors, and all 326 synthetic checks passed. See the [run record](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md)
+and zero errors, and all 434 synthetic checks passed for both source and portable EXE. See the [run record](docs/AUDIT_FIXES.zh-CN.md)
 for the exact commit and logs. Live Codex integration, UI, actual registry migration and
 live IPC remain untested. The new TTFT detail row still needs visual and behavioral validation.
 
