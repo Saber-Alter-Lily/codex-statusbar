@@ -32,8 +32,9 @@ internal static class RecentSessionSelfTest
                 && rows.Single(row => row.ThreadId == a).TotalTokens == 30
                 && rows.Single(row => row.ThreadId == b).TotalTokens == 80));
             checks.Add(("two conversations have independent speed and TTFT", rows.Count == 2
-                && rows.Single(row => row.ThreadId == a).Tps == 20
-                && rows.Single(row => row.ThreadId == b).Tps == 70
+                && rows.Single(row => row.ThreadId == a).LastTurnTps == 20
+                && rows.Single(row => row.ThreadId == b).LastTurnTps == 70
+                && rows.All(row => row.Tps is null)
                 && rows.Single(row => row.ThreadId == a).TtftMs == 111
                 && rows.Single(row => row.ThreadId == b).TtftMs == 222));
             checks.Add(("current row is marked without merging totals", rows.Count(row => row.IsCurrent) == 1

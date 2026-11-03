@@ -52,6 +52,7 @@ internal sealed class RolloutReader
 
     /// <summary>Byte offset of the end of the last read; incomplete trailing bytes are held separately.</summary>
     public long Offset { get; private set; }
+    public long ObservedLength { get; private set; }
 
     /// <summary>Total bytes handed to the parser so far (for the debug log).</summary>
     public long ParsedBytes { get; private set; }
@@ -88,6 +89,7 @@ internal sealed class RolloutReader
         }
 
         var length = SafeLength(stream);
+        ObservedLength = length;
         _headIdentity = ReadHeadIdentity(stream);
 
         if (length <= 0)
@@ -156,6 +158,7 @@ internal sealed class RolloutReader
             TailWindowBytes = Math.Min(window, length);
         }
 
+        ObservedLength = length;
         _initialized = true;
     }
 
@@ -194,6 +197,7 @@ internal sealed class RolloutReader
         }
 
         var length = SafeLength(stream);
+        ObservedLength = length;
         if (length < Offset)
         {
             // Size shrank: the file was truncated or replaced. A fresh tail read is the only safe move.
@@ -233,6 +237,7 @@ internal sealed class RolloutReader
         _discardUntilNewline = false;
         _pending = [];
         Offset = 0;
+        ObservedLength = 0;
         ParsedBytes = 0;
     }
 

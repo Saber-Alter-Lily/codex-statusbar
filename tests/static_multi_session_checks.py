@@ -20,7 +20,8 @@ check("File.Write" not in recent and "Console." not in recent and "DebugDiagnost
       "no persistence or diagnostic emission of multi-session identities")
 check(".Sum(" not in recent, "no combined TPS/tokens")
 check("!entry.Id.Equals(id" in recent and "_entries.Remove(previous.Id)" in recent, "same-path replacement retires old thread")
-check("entry.Readable && !stale ? tracker.DisplayTps : null" in recent, "stale/unreadable speed not live")
+check("entry.Readable && !stale && tracker.Streaming" in recent
+      and "MonitoringStatus.IsFresh" in recent, "stale/unreadable/completed speed not live")
 check("now - write > RetainFor" in recent, "expired backlog cannot resurrect old history")
 check("new byte[64 * 1024]" in recent and "Guid.TryParse" in recent, "bounded authoritative metadata identity")
 program = read("Program.cs")

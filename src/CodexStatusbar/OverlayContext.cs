@@ -125,6 +125,14 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private string? _lastPositionSignature;
     private int _themeRefreshTicks;
     private bool _menuReady;
+    private readonly MonitoringPanelForm _panel = new();
+    private readonly EventWaitHandle _showPanelRequest = new(false, EventResetMode.AutoReset, Program.ShowPanelEventName);
+    private RegisteredWaitHandle? _showPanelWait;
+    private string? _manualThreadId;
+    private long _selectionRevision;
+    private IReadOnlyList<RecentSessionMetric> _recentMetrics = [];
+    private bool _discoveryIncomplete;
+    private DateTime? _lastSuccessfulPollUtc;
 
     public OverlayContext(
         string sessionRoot,
@@ -137,6 +145,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _settingsPath = settingsPath;
         _debug = debug ?? new DebugDiagnostics(false);
         _forcedThreadId = forcedThreadId;
+        _manualThreadId = forcedThreadId;
         _background = background;
         _positionDiagnostics = positionDiagnostics;
         _modeLabel = background ? "background" : "interactive";
@@ -208,10 +217,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _pinSessionMenuItem = new ToolStripMenuItem("锁定当前会话") { Enabled = false, CheckOnClick = true };
         _pinSessionMenuItem.CheckedChanged += (_, _) =>
         {
-            if (_monitor is { } monitor)
-            {
-                monitor.PinActiveSession = _pinSessionMenuItem.Checked;
-            }
+            if (_pinSessionMenuItem.Checked && _manualThreadId is null)
+                SelectPanelSession(_lastSnapshot?.ThreadId);
+            else if (!_pinSessionMenuItem.Checked && _manualThreadId is not null)
+                SelectPanelSession(null);
 
             _pinSessionMenuItem.Text = _pinSessionMenuItem.Checked ? "已锁定当前会话" : "锁定当前会话";
         };
@@ -399,12 +408,32 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         exitItem.Click += (_, _) => ExitOverlay();
         menu.Items.Add(exitItem);
 
+        var trayMenu = new ContextMenuStrip();
+        var openPanel = new ToolStripMenuItem("打开用量与速度面板");
+        openPanel.Click += (_, _) => ShowPanel();
+        trayMenu.Items.Add(openPanel);
+        var trayExit = new ToolStripMenuItem("退出监测");
+        trayExit.Click += (_, _) => ExitOverlay();
+        trayMenu.Items.Add(trayExit);
         _trayIcon = new NotifyIcon
         {
             Icon = SystemIcons.Information,
             Text = "Codex Token 状态条",
             Visible = true,
-            ContextMenuStrip = menu
+            ContextMenuStrip = trayMenu
+        };
+        _trayIcon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowPanel(); };
+        _panel.SessionSelected += id => SelectPanelSession(id);
+        _panel.AutoRequested += () => SelectPanelSession(null);
+        _panel.RefreshRequested += () => RequestBackgroundPoll();
+        _panel.SettingsRequested += () => menu.Show(_panel, new Point(24, 170));
+        _panel.ExitRequested += ExitOverlay;
+        _panel.StripFieldsChanged += fields =>
+        {
+            _settings.CompactFields = StripFieldRules.Sanitize(fields);
+            _settings.Save(_settingsPath);
+            RefreshPresentation();
+            if (_currentTarget is not null && !_manuallyHidden) ApplyLayout(_currentTarget);
         };
 
         _form.SetPresentation(_presentation);
@@ -439,6 +468,45 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _positionTimer.Tick += (_, _) => OnPositionTimerTick();
 
         _timer.Start();
+        _ = _panel.Handle;
+        _showPanelWait = ThreadPool.RegisterWaitForSingleObject(_showPanelRequest, (_, _) =>
+        {
+            if (Volatile.Read(ref _disposed) == 0)
+                try { _panel.BeginInvoke((Action)ShowPanel); }
+                catch (InvalidOperationException) { }
+        }, null, Timeout.Infinite, false);
+        if (!_background) ShowPanel();
+    }
+
+    private void ShowPanel()
+    {
+        if (Volatile.Read(ref _disposed) != 0 || _panel.IsDisposed) return;
+        UpdatePanel();
+        if (_panel.WindowState == FormWindowState.Minimized) _panel.WindowState = FormWindowState.Normal;
+        _panel.Show();
+        _panel.Activate();
+    }
+
+    private void SelectPanelSession(string? id)
+    {
+        if (id is not null && !RolloutDiscovery.IsPlausibleThreadId(id)) return;
+        if (string.Equals(id, _manualThreadId, StringComparison.OrdinalIgnoreCase)) return;
+        _manualThreadId = id;
+        Interlocked.Increment(ref _selectionRevision);
+        _lastSnapshot = null;
+        _pendingSnapshot = null;
+        _pendingThreadId = null;
+        _pinSessionMenuItem.Checked = id is not null;
+        RefreshPresentation();
+        UpdatePanel();
+        RequestBackgroundPoll();
+    }
+
+    private void UpdatePanel()
+    {
+        if (_panel.IsDisposed) return;
+        _panel.Present(_lastSnapshot, _recentMetrics, _pendingRouteStatus, _manualThreadId,
+            _discoveryIncomplete, DateTime.UtcNow, _watcher.Current.Version, _lastSuccessfulPollUtc, _settings.CompactFields);
     }
 
     private void AddAnchorMenu(ToolStripMenuItem menu, string text, AnchorMode mode)
@@ -781,7 +849,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _observedRouteVersion = -1;
         _lastPositionSignature = null;
         _pinSessionMenuItem.Enabled = false;
-        _pinSessionMenuItem.Checked = false;
+        _pinSessionMenuItem.Checked = _manualThreadId is not null;
         _interaction.CollapseForHostChange();
         StopOutsideClickPolling();
         _form.Hide();
@@ -824,6 +892,9 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _routeMonitor.Stop();
         _monitor?.Dispose();
         _monitor = null;
+        _lastSuccessfulPollUtc = null;
+        _recentMetrics = [];
+        _discoveryIncomplete = false;
         UpdateRecentSessionMenu([], false);
         CollapseAndHide();
         _currentTarget = null;
@@ -1353,6 +1424,9 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
 
     private void TickCore()
     {
+        if (_panel.Visible) UpdatePanel();
+        // Freshness can expire without a counter change.
+        RefreshPresentation();
         UpdateInputDiscoveryGate();
         _lifecycle.OverlayVisible = _form.Visible;
 
@@ -1433,6 +1507,12 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         var snapshot = _pendingSnapshot;
+        if (snapshot is null && _lastSnapshot is not null)
+        {
+            _lastSnapshot = null;
+            RefreshPresentation();
+            UpdateSessionMenuText();
+        }
         if (snapshot is not null && snapshot != _lastSnapshot)
         {
             _lastSnapshot = snapshot;
@@ -1502,20 +1582,16 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         var uiScheduler = TaskScheduler.FromCurrentSynchronizationContext();
+        var selectionRevision = Interlocked.Read(ref _selectionRevision);
+        var manualThread = _manualThreadId;
         _ = Task.Run(() =>
             {
                 var routeStatus = _routeMonitor.GetStatus();
-                if (!monitor.PinActiveSession)
-                {
-                    if (!string.IsNullOrWhiteSpace(routeStatus.ThreadId))
-                    {
-                        monitor.PreferredThreadId = routeStatus.ThreadId;
-                    }
-                    else if (!routeStatus.IsConnected)
-                    {
-                        monitor.PreferredThreadId = null;
-                    }
-                }
+                monitor.ObserveRouteCandidate(routeStatus.IsConnected ? routeStatus.ThreadId : null);
+                monitor.PinActiveSession = manualThread is not null;
+                monitor.IsForcedPin = manualThread is not null && manualThread == _forcedThreadId;
+                monitor.PreferredThreadId = manualThread;
+                monitor.SelectionSource = manualThread is null ? "none" : "manual";
                 var snapshot = monitor.Poll();
                 return (
                     Snapshot: snapshot,
@@ -1523,6 +1599,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
                     ThreadId: monitor.ActiveThreadId,
                     RouteStatus: routeStatus,
                     RecentSessions: monitor.RecentSessions.Latest,
+                    CompletedAtUtc: DateTime.UtcNow,
                     DiscoveryIncomplete: monitor.RecentSessions.DiscoveryIncomplete);
             })
             .ContinueWith(task =>
@@ -1530,13 +1607,18 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
                 try
                 {
                     if (Volatile.Read(ref _disposed) == 0 && ReferenceEquals(monitor, _monitor)
+                        && selectionRevision == Interlocked.Read(ref _selectionRevision)
                         && task.Status == TaskStatus.RanToCompletion)
                     {
                         _pendingSnapshot = task.Result.Snapshot;
+                        _lastSuccessfulPollUtc = task.Result.CompletedAtUtc;
                         _pendingSessionVersion = task.Result.Version;
                         _pendingThreadId = task.Result.ThreadId;
                         _pendingRouteStatus = task.Result.RouteStatus;
+                        _recentMetrics = task.Result.RecentSessions;
+                        _discoveryIncomplete = task.Result.DiscoveryIncomplete;
                         UpdateRecentSessionMenu(task.Result.RecentSessions, task.Result.DiscoveryIncomplete);
+                        UpdatePanel();
                     }
                 }
                 finally
@@ -1563,15 +1645,15 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     {
         _presentation = _lastSnapshot is null
             ? OverlayPresentationBuilder.CreateWaiting(
-                "正在寻找当前 Codex 会话…",
+                _manualThreadId is null ? MonitoringStatus.Route(_pendingRouteStatus) : "正在读取手动锁定会话…",
                 _settings.CollapsedPrimaryField,
                 _settings.CollapsedSecondaryField,
-                _settings.VisibleFields)
+                _settings.VisibleFields, _settings.CompactFields)
             : OverlayPresentationBuilder.Create(
                 _lastSnapshot,
                 _settings.CollapsedPrimaryField,
                 _settings.CollapsedSecondaryField,
-                _settings.VisibleFields);
+                _settings.VisibleFields, _settings.CompactFields);
         _form.SetPresentation(_presentation);
     }
 
@@ -1822,7 +1904,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _presentation.ShowContextProgress,
         manualTopLeft,
         _settings.OverlayScalePercent,
-        capsuleSize,
+        capsuleSize ?? (manualTopLeft is not null ? CapsuleSizeForHost(hostWindow) : null),
         dock,
         OverlaySettings.SanitizeContextGap(_settings.ContextGapDip));
 
@@ -2021,20 +2103,23 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     /// now hugs its glyphs: resolving an anchor against the old fixed 330 DIP constant while the
     /// layout used the measured width would offset the strip by exactly the difference.
     /// </summary>
-    private Size CapsuleSizeFor(CodexWindowTarget target, int? scalePercent = null)
+    private Size CapsuleSizeFor(CodexWindowTarget target, int? scalePercent = null) =>
+        CapsuleSizeForHost(target.HostWindow, scalePercent);
+
+    private Size CapsuleSizeForHost(CodexWindowInfo host, int? scalePercent = null)
     {
         var scale = ManualAttachmentRules.SanitizeScale(scalePercent ?? _settings.OverlayScalePercent);
-        var widths = _form.MeasureCapsuleWidthsDip();
+        var widths = _form.MeasureCapsuleWidthsDip(host.Dpi);
         if (widths.Length > 0)
         {
             var variant = Math.Clamp(_form.CapsuleVariantIndex, 0, widths.Length - 1);
-            return OverlayLayoutCalculator.GetCapsuleSizeForText(widths[variant], target.HostWindow.Dpi, scale);
+            return OverlayLayoutCalculator.GetCapsuleSizeForText(widths[variant], host.Dpi, scale);
         }
 
         return OverlayLayoutCalculator.GetManualCapsuleSize(
-            target.HostWindow.Dpi,
+            host.Dpi,
             scale,
-            target.HostWindow.WorkingArea);
+            host.WorkingArea);
     }
 
     /// <summary>The capsule's real on-screen rectangle, as currently rendered.</summary>
@@ -2608,6 +2693,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _hostSampler.Dispose();
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
+            _showPanelWait?.Unregister(null);
+            _showPanelRequest.Dispose();
+            _panel.CloseForExit();
+            _panel.Dispose();
             _hotkey.Dispose();
             _watcher.Dispose();
             _routeMonitor.Dispose();

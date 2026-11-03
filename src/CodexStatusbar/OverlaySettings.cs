@@ -156,6 +156,7 @@ internal sealed class OverlaySettings
         // --- v1 layout keys, still written for backward compatibility ---
         public int? AnchorMode { get; set; }
         public int? VisibleFields { get; set; }
+        public int? CompactFields { get; set; }
         public int? CollapsedPrimaryField { get; set; }
         public int? CollapsedSecondaryField { get; set; }
         public bool? ManualPlacementEnabled { get; set; }
@@ -184,6 +185,7 @@ internal sealed class OverlaySettings
     public int SettingsVersion { get; private set; }
     public AnchorMode AnchorMode { get; set; }
     public DisplayField VisibleFields { get; set; }
+    public StripField CompactFields { get; set; } = StripFieldRules.Default;
     public DisplayField CollapsedPrimaryField { get; private set; }
     public DisplayField CollapsedSecondaryField { get; private set; }
     public bool ManualPlacementEnabled { get; set; }
@@ -298,6 +300,7 @@ internal sealed class OverlaySettings
             settings.AnchorMode = SanitizeAnchorMode(persisted.AnchorMode);
             settings.VisibleFields = DisplayFieldRules.SanitizeVisible(
                 (DisplayField)(persisted.VisibleFields ?? (int)DefaultVisibleFields));
+            settings.CompactFields = StripFieldRules.Sanitize((StripField)(persisted.CompactFields ?? (int)StripFieldRules.Default));
             settings.SetCollapsedFields(
                 (DisplayField)(persisted.CollapsedPrimaryField ?? (int)DisplayField.Tps),
                 (DisplayField)(persisted.CollapsedSecondaryField ?? (int)DisplayField.Total));
@@ -385,6 +388,7 @@ internal sealed class OverlaySettings
             // v1 keys, kept so an older build can still read this file.
             AnchorMode = (int)SanitizeAnchorMode((int)AnchorMode),
             VisibleFields = (int)DisplayFieldRules.SanitizeVisible(VisibleFields),
+            CompactFields = (int)StripFieldRules.Sanitize(CompactFields),
             CollapsedPrimaryField = (int)CollapsedPrimaryField,
             CollapsedSecondaryField = (int)CollapsedSecondaryField,
             ManualPlacementEnabled = ManualPlacementEnabled,

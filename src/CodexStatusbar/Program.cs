@@ -160,6 +160,9 @@ internal static class Program
         using var singleInstanceMutex = AcquireSingleInstance(options.RestartWait);
         if (singleInstanceMutex is null)
         {
+            try { using var request = EventWaitHandle.OpenExisting(ShowPanelEventName); request.Set(); }
+            catch (WaitHandleCannotBeOpenedException) { }
+            catch (UnauthorizedAccessException) { }
             return 0;
         }
 
@@ -176,6 +179,7 @@ internal static class Program
 
     /// <summary>Name of the single-instance object. <c>Local\</c>: one per logon session, no admin.</summary>
     internal const string SingleInstanceMutexName = "Local\\CodexStatusbar.SingleInstance";
+    internal const string ShowPanelEventName = "Local\\CodexStatusbar.ShowPanel";
 
     private static Mutex? AcquireSingleInstance(bool waitForRestart)
     {
@@ -282,7 +286,12 @@ internal sealed record TokenSnapshot(
     long MergedModelElapsedMs = 0,
     IReadOnlyList<string>? ModelIntervals = null,
     string Carrier = "none",
-    int DedupIgnored = 0)
+    int DedupIgnored = 0,
+    DateTime? LastUsageAtUtc = null,
+    long? TurnInputTokens = null,
+    long? TurnCachedInputTokens = null,
+    bool UsageBreakdownKnown = true,
+    long ObservedLogLength = 0)
 {
     public double? CacheHitPercent => MetricFormat.CacheHitPercent(InputTokens, CachedInputTokens);
 
@@ -433,6 +442,7 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            var connectionStage = "connect";
             try
             {
                 using var pipe = new NamedPipeClientStream(
@@ -442,10 +452,12 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
                     PipeOptions.Asynchronous);
 
                 await pipe.ConnectAsync(2500, cancellationToken).ConfigureAwait(false);
+                connectionStage = "identity";
                 using var verifiedServer = await AuthenticateAndInitializeAsync(pipe, cancellationToken)
                     .ConfigureAwait(false);
                 FrameObserver?.Invoke("connected to verified Codex IPC server");
                 MarkConnected();
+                connectionStage = "receive";
                 retryDelay = TimeSpan.FromMilliseconds(350);
 
                 while (!cancellationToken.IsCancellationRequested && pipe.IsConnected)
@@ -489,7 +501,7 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
                 or InvalidDataException or JsonException or InvalidOperationException or TimeoutException)
             {
                 FrameObserver?.Invoke("error " + exception.GetType().Name);
-                MarkDisconnected(exception.Message);
+                MarkDisconnected(connectionStage + ":" + exception.GetType().Name);
             }
 
             FrameObserver?.Invoke("disconnected");
@@ -595,7 +607,20 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
             return;
         }
 
-        // The client id identifies the window; a broadcast that omits it is still followed.
+        // Remote/cloud hosts cannot supply this profile's local rollout. Missing source identity
+        // cannot be bound to a window. Retire subscriptions from that source rather than guessing.
+        if (!hostId.Equals("local", StringComparison.OrdinalIgnoreCase) || string.IsNullOrWhiteSpace(sourceClientId))
+        {
+            lock (_sync)
+            {
+                foreach (var old in _activeByWindow.Keys.Where(k => string.IsNullOrWhiteSpace(sourceClientId)
+                    || k.StartsWith(sourceClientId + "\u001f", StringComparison.Ordinal)).ToArray())
+                    _activeByWindow.Remove(old);
+                RecomputeActiveThread();
+            }
+            return;
+        }
+        // This identifies an IPC subscriber, not an authenticated native HWND.
         var key = $"{sourceClientId ?? "unattributed"}\u001f{hostId}";
         lock (_sync)
         {
@@ -680,10 +705,11 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
 
     private void RecomputeActiveThread()
     {
-        var nextThreadId = _activeByWindow.Values
-            .OrderByDescending(item => item.Sequence)
-            .Select(item => item.ThreadId)
-            .FirstOrDefault();
+        // IPC subscriptions have no authenticated HWND mapping. Never choose the latest
+        // broadcaster across windows. A unique route is only a candidate for the panel.
+        var threads = _activeByWindow.Values.Select(item => item.ThreadId)
+            .Distinct(StringComparer.OrdinalIgnoreCase).Take(2).ToArray();
+        var nextThreadId = threads.Length == 1 ? threads[0] : null;
         if (!string.Equals(nextThreadId, _activeThreadId, StringComparison.OrdinalIgnoreCase))
         {
             _activeThreadId = nextThreadId;
@@ -752,6 +778,8 @@ internal sealed class TokenLogMonitor : IDisposable
     private string? _cachedSignature;
     private TokenSnapshot? _lastSnapshot;
     private DateTime _lastStateDatabaseQueryUtc = DateTime.MinValue;
+    private bool _recentSeeded;
+    private string? _lastRouteCandidate;
 
     // Resolved once: enumerating processes on every poll would be wasteful, and the client's PID
     // and package version do not change while it runs.
@@ -805,6 +833,20 @@ internal sealed class TokenLogMonitor : IDisposable
     /// </summary>
     public bool IsForcedPin { get; set; }
 
+    // An IPC subscription identifies a conversation, but cannot prove which native page is open.
+    // Only an explicit local selection is authoritative until the client exposes a HWND mapping.
+    public string SelectionSource { get; set; } = "manual";
+
+    public void ObserveRouteCandidate(string? threadId)
+    {
+        if (string.Equals(threadId, _lastRouteCandidate, StringComparison.OrdinalIgnoreCase)) return;
+        _lastRouteCandidate = threadId;
+        if (string.IsNullOrWhiteSpace(threadId) || !RolloutDiscovery.IsPlausibleThreadId(threadId)) return;
+        var record = TryReadStateRecord(threadId);
+        if (record?.RolloutPath is string path && IsRolloutForThread(path, threadId!, true))
+            RecentSessions.SeedPath(path);
+    }
+
     /// <summary>Bytes parsed from the current rollout file (for the debug log).</summary>
     public long RolloutOffset => _reader?.Offset ?? 0;
 
@@ -817,20 +859,26 @@ internal sealed class TokenLogMonitor : IDisposable
         try
         {
             _discovery.BeginPoll();
+            if (!_recentSeeded)
+            {
+                _recentSeeded = true;
+                foreach (var record in StateDatabase.TryReadRecentThreads(_stateDatabasePath))
+                    if (record.RolloutPath is string path && IsRolloutForThread(path, record.Id, true))
+                        RecentSessions.SeedPath(path);
+            }
             var preferred = PreferredThreadId;
             var hasPreferred = !string.IsNullOrWhiteSpace(preferred);
 
-            if (PinActiveSession && hasPreferred && _selectedThreadId is null)
-                SelectPreferredRootSession(preferred!, "forced");
+            if (PinActiveSession && hasPreferred && !string.Equals(_selectedThreadId, preferred, StringComparison.OrdinalIgnoreCase))
+                SelectPreferredRootSession(preferred!, IsForcedPin ? "forced" : SelectionSource);
             else if (!PinActiveSession && hasPreferred)
-                SelectPreferredRootSession(preferred!, "ipc");
+                SelectPreferredRootSession(preferred!, SelectionSource);
             else if (PinActiveSession && _selectedThreadId is not null)
             {
                 // Pinned to one conversation: never follow another.
             }
-            else if (forceFullScan || _lastStateDatabaseQueryUtc == DateTime.MinValue
-                || DateTime.UtcNow - _lastStateDatabaseQueryUtc > StateDatabaseRefreshInterval)
-                SelectFromStateDatabase();
+            else if (_selectedThreadId is not null)
+                SwitchActiveLog(null, null, "none");
 
             _disposedToken.ThrowIfCancellationRequested();
             // Watcher hints can resolve a newly created file without a recursive search. Selection
@@ -840,7 +888,7 @@ internal sealed class TokenLogMonitor : IDisposable
             _disposedToken.ThrowIfCancellationRequested();
             RefreshReader();
             _disposedToken.ThrowIfCancellationRequested();
-            var snapshot = BuildSnapshot();
+            var snapshot = _selectedThreadId is null ? null : BuildSnapshot();
             RecentSessions.Poll(_readerPath, _selectedThreadId);
             return snapshot;
         }
@@ -972,8 +1020,7 @@ internal sealed class TokenLogMonitor : IDisposable
                 _readerPath = path;
                 _discovery.Remember(_selectedThreadId, !IsForcedPin, path);
             }
-            else if (_selectedThreadId is null && IsRootDesktopSession(path))
-                SwitchActiveLog(path, ExtractThreadId(path), "rollout");
+            // New logs populate the bounded panel list; they do not become the current page.
         }
     }
 
@@ -1125,6 +1172,9 @@ internal sealed class TokenLogMonitor : IDisposable
             tps is null ? string.Empty : tps.Value.ToString("0.000", CultureInfo.InvariantCulture),
             lastTurnTps is null ? string.Empty : lastTurnTps.Value.ToString("0.000", CultureInfo.InvariantCulture),
             tracker?.IsHeld == true ? "1" : "0",
+            state?.LastMetadataAtUtc?.Ticks.ToString(CultureInfo.InvariantCulture) ?? "",
+            state?.LastUsageAtUtc?.Ticks.ToString(CultureInfo.InvariantCulture) ?? "",
+            _reader?.ObservedLength.ToString(CultureInfo.InvariantCulture) ?? "0",
             _reader?.Offset.ToString(CultureInfo.InvariantCulture) ?? "0",
             string.Join(',', warnings),
             _codexInfo.ProcessId.ToString(CultureInfo.InvariantCulture),
@@ -1150,8 +1200,8 @@ internal sealed class TokenLogMonitor : IDisposable
             state?.ReasoningOutputTokens ?? 0,
             state?.ContextUsedTokens ?? 0,
             state?.ContextWindowTokens ?? 0,
-            SafeGetLastWriteUtc(path),
-            _stateRecord?.Title ?? string.Empty,
+            state?.LastMetadataAtUtc ?? SafeGetLastWriteUtc(path),
+            string.Empty,
             state?.CurrentTurnId,
             state?.Streaming == true,
             tracker?.TurnGenerationMs ?? 0,
@@ -1172,7 +1222,12 @@ internal sealed class TokenLogMonitor : IDisposable
             tracker?.MergedModelElapsedMs ?? 0,
             intervals,
             state?.Carrier ?? "none",
-            dedupIgnored);
+            dedupIgnored,
+            state?.LastUsageAtUtc,
+            state?.TurnInputTokens,
+            state?.TurnCachedInputTokens,
+            state?.HasRolloutUsage == true,
+            _reader?.ObservedLength ?? 0);
         return _lastSnapshot;
     }
 
@@ -1271,14 +1326,8 @@ internal static class HeadlessRunner
         if (string.IsNullOrWhiteSpace(options.ForcedThreadId))
         {
             var route = routeMonitor.GetStatus();
-            if (!string.IsNullOrWhiteSpace(route.ThreadId))
-            {
-                monitor.PreferredThreadId = route.ThreadId;
-            }
-            else if (!route.IsConnected)
-            {
-                monitor.PreferredThreadId = null;
-            }
+            monitor.ObserveRouteCandidate(route.IsConnected ? route.ThreadId : null);
+            monitor.PreferredThreadId = null;
         }
 
         var snapshot = monitor.Poll();

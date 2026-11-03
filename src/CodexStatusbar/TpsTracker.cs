@@ -164,6 +164,24 @@ internal static class TpsRules
 internal sealed class TpsTracker
 {
     private readonly HashSet<string> _seenResponseKeys = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (string Key, long Output)> _responseCheckpoints = new(StringComparer.Ordinal);
+    private bool _preferExplicitResponses;
+
+    public void PreferExplicitResponses()
+    {
+        if (_preferExplicitResponses) return;
+        _preferExplicitResponses = true;
+        foreach (var entry in _responseCheckpoints.Values)
+            if (entry.Key.StartsWith("checkpoint:", StringComparison.Ordinal))
+            {
+                _turnOutputFromResponses -= entry.Output;
+                _seenResponseKeys.Remove(entry.Key);
+            }
+        _responseCheckpoints.Clear();
+        // The older carrier may have a different, lagging counter baseline.
+        _hasThreadOutputBaseline = false;
+        _turnOutputFromThreadDelta = 0;
+    }
 
     /// <summary>
     /// Raw model-output windows as they were observed, in arrival order. Reasoning and AgentMessage
@@ -319,6 +337,7 @@ internal sealed class TpsTracker
         _turnOutputFromTurnUsage = 0;
         _turnOutputFromResponses = 0;
         _seenResponseKeys.Clear();
+        _responseCheckpoints.Clear();
         _threadOutputAtTurnStart = threadCumulativeOutputTokens;
         _hasThreadOutputBaseline = hasCumulative;
         _turnOutputFromThreadDelta = 0;
@@ -473,19 +492,45 @@ internal sealed class TpsTracker
     /// Per-response official output, deduplicated by response identity. Used only when neither exact
     /// carrier exists, so a repeated token_count event cannot double count.
     /// </summary>
-    public void ObserveResponseOutput(string responseKey, long outputTokens)
+    public void ObserveResponseOutput(string? responseKey, long outputTokens, string? cumulativeKey = null)
     {
-        if (outputTokens <= 0)
+        if (outputTokens <= 0 || (responseKey is null && (cumulativeKey is null || _preferExplicitResponses)))
         {
             return;
         }
-
-        if (!_seenResponseKeys.Add(responseKey))
+        if (responseKey is not null && _seenResponseKeys.Contains(responseKey))
         {
             DuplicateResponseSamplesIgnored++;
             return;
         }
 
+        // Legacy snapshots have no response ID. Join carriers only at the same validated
+        // cumulative checkpoint, never by equal per-call token values across responses.
+        var legacy = responseKey is null;
+        if (cumulativeKey is not null && _responseCheckpoints.TryGetValue(cumulativeKey, out var previous))
+        {
+            if (legacy)
+            {
+                DuplicateResponseSamplesIgnored++;
+                return;
+            }
+            if (previous.Key.StartsWith("checkpoint:", StringComparison.Ordinal))
+            {
+                _turnOutputFromResponses -= previous.Output;
+                _seenResponseKeys.Remove(previous.Key);
+            }
+        }
+        responseKey ??= "checkpoint:" + cumulativeKey;
+
+        if (_seenResponseKeys.Contains(responseKey))
+        {
+            DuplicateResponseSamplesIgnored++;
+            return;
+        }
+        // Stop accepting unmatched samples at the budget; never evict identities and recount them.
+        if (_seenResponseKeys.Count >= 4096 || _responseCheckpoints.Count >= 4096) return;
+        _seenResponseKeys.Add(responseKey);
+        if (cumulativeKey is not null) _responseCheckpoints[cumulativeKey] = (responseKey, outputTokens);
         _turnOutputFromResponses += outputTokens;
     }
 
@@ -567,6 +612,7 @@ internal sealed class TpsTracker
         _turnOutputFromThreadDelta = 0;
         _turnOutputFromResponses = 0;
         _seenResponseKeys.Clear();
+        _responseCheckpoints.Clear();
         _threadOutputAtTurnStart = 0;
         _hasThreadOutputBaseline = false;
         _lastFoldGenerationMs = -1;
@@ -653,6 +699,19 @@ internal sealed class RolloutStreamState
     /// <summary>True when at least one cumulative reading came from the rollout itself.</summary>
     public bool HasRolloutUsage { get; set; }
 
+    public DateTime? LastMetadataAtUtc { get; private set; }
+    public DateTime? LastUsageAtUtc { get; private set; }
+    private bool _hasExplicitUsageCarrier;
+    private long? _turnInputBaseline;
+    private long? _turnCachedBaseline;
+    private string? _counterTurn;
+    private long? _reportedTurnInput;
+    private long? _reportedTurnCached;
+    public long? TurnInputTokens => _counterTurn == CurrentTurnId
+        ? _reportedTurnInput ?? (_turnInputBaseline is long value && InputTokens >= value ? InputTokens - value : null) : null;
+    public long? TurnCachedInputTokens => _counterTurn == CurrentTurnId
+        ? _reportedTurnCached ?? (_turnCachedBaseline is long value && CachedInputTokens >= value ? CachedInputTokens - value : null) : null;
+
     public string? CurrentTurnId { get; set; }
 
     public bool Streaming => Tps.Streaming;
@@ -727,6 +786,22 @@ internal sealed class RolloutStreamState
                     Warnings.Add("record:" + recordType);
                     break;
             }
+            // File mtime can remain unchanged while the writer holds its handle. The event
+            // timestamp, not polling time or filesystem mtime, describes metric freshness.
+            // Any known local record is log activity. Activity and reported token counts are
+            // separate clocks: response/tool records must not be treated as new usage samples.
+            var relevant = KnownRecordTypes.Contains(recordType);
+            if (relevant && root.TryGetProperty("timestamp", out var stamp)
+                && stamp.ValueKind == JsonValueKind.String
+                && DateTime.TryParse(stamp.GetString(), CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var timestamp))
+            {
+                LastMetadataAtUtc = timestamp;
+                if (HasRolloutUsage && (recordType == "token_usage_record"
+                    || (root.TryGetProperty("payload", out var p) && p.ValueKind == JsonValueKind.Object
+                        && GetString(p, "type") == "token_count" && !_hasExplicitUsageCarrier)))
+                    LastUsageAtUtc = timestamp;
+            }
         }
     }
 
@@ -792,6 +867,11 @@ internal sealed class RolloutStreamState
     {
         var turnId = GetString(payload, "turn_id");
         CurrentTurnId = turnId;
+        _counterTurn = turnId;
+        _turnInputBaseline = HasCumulativeUsage ? InputTokens : null;
+        _turnCachedBaseline = HasCumulativeUsage ? CachedInputTokens : null;
+        _reportedTurnInput = null;
+        _reportedTurnCached = null;
         Tps.BeginTurn(turnId, itemsComplete: true, OutputTokens, HasCumulativeUsage);
     }
 
@@ -814,7 +894,7 @@ internal sealed class RolloutStreamState
             return;
         }
 
-        if (info.TryGetProperty("total_token_usage", out var total) && total.ValueKind == JsonValueKind.Object)
+        if (!_hasExplicitUsageCarrier && info.TryGetProperty("total_token_usage", out var total) && total.ValueKind == JsonValueKind.Object)
         {
             // Cumulative for the whole thread. Redundant with token_usage_record on 0.159 and the
             // only carrier on older Codex, so "last one wins in file order" is right for both.
@@ -831,17 +911,14 @@ internal sealed class RolloutStreamState
             ContextUsedTokens = ReadRequestSize(last);
 
             var lastOutput = GetLong(last, "output_tokens");
-            if (lastOutput > 0)
+            if (lastOutput > 0 && !_hasExplicitUsageCarrier)
             {
-                // Older Codex (0.151) has no token_usage_record, so the per-response official count
-                // exists only here. The dedup key is derived from the VALUES rather than from the
-                // carrier: 0.159 emits both carriers with byte-identical usage for one response, so a
-                // carrier-specific key would count every response twice (measured: exactly 2x).
-                Tps.ObserveResponseOutput(ResponseSampleKey(last), lastOutput);
+                Tps.ObserveResponseOutput(null, lastOutput,
+                    info.TryGetProperty("total_token_usage", out var checkpoint) ? CumulativeSampleKey(checkpoint) : null);
             }
         }
 
-        Tps.RefreshMeasurement();
+        if (!_hasExplicitUsageCarrier) Tps.RefreshMeasurement();
     }
 
     private void ObserveTokenUsageRecord(JsonElement root)
@@ -869,6 +946,12 @@ internal sealed class RolloutStreamState
         if (payload.TryGetProperty("thread_token_usage", out var threadUsage)
             && threadUsage.ValueKind == JsonValueKind.Object)
         {
+            if (TryGetLong(threadUsage, "input_tokens") is >= 0
+                && TryGetLong(threadUsage, "output_tokens") is >= 0)
+            {
+                _hasExplicitUsageCarrier = true;
+                Tps.PreferExplicitResponses();
+            }
             ApplyCumulativeUsage(threadUsage, "token_usage_record");
         }
 
@@ -884,13 +967,19 @@ internal sealed class RolloutStreamState
             // treating it as a per-turn value would put the whole conversation's output in the
             // numerator. Hence the equality guard: only a genuinely different value is trusted.
             Tps.ObserveTurnUsageOutput(GetLong(turnUsage, "output_tokens"));
+            _counterTurn = CurrentTurnId;
+            _reportedTurnInput = TryGetLong(turnUsage, "input_tokens");
+            _reportedTurnCached = TryGetLong(turnUsage, "cached_input_tokens");
         }
 
         if (payload.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
         {
             // "Context used" is the size of the current request, never the conversation total.
             ContextUsedTokens = ReadRequestSize(usage);
-            Tps.ObserveResponseOutput(ResponseSampleKey(usage), GetLong(usage, "output_tokens"));
+            var responseId = GetString(payload, "response_id");
+            Tps.ObserveResponseOutput(string.IsNullOrWhiteSpace(responseId) ? null : "response:" + responseId,
+                GetLong(usage, "output_tokens"), payload.TryGetProperty("thread_token_usage", out var checkpoint)
+                    ? CumulativeSampleKey(checkpoint) : null);
         }
 
         Tps.RefreshMeasurement();
@@ -930,7 +1019,8 @@ internal sealed class RolloutStreamState
         Tps.ObserveModelOutputItem(
             TryGetLong(payload, "started_at_ms") ?? 0,
             TryGetLong(payload, "completed_at_ms") ?? 0);
-        Tps.RefreshMeasurement();
+        // A completed item changes only the denominator. Wait for matching official usage
+        // before folding another speed sample; old tokens / newer time is not a fresh rate.
     }
 
     private void ApplyCumulativeUsage(JsonElement usage, string carrier)
@@ -1007,14 +1097,15 @@ internal sealed class RolloutStreamState
     }
 
     /// <summary>
-    /// Carrier-independent identity of one official model response, built from its own usage values.
-    /// Both carriers report identical values for a response, and repeated events repeat them too, so
-    /// this key makes the per-response numerator immune to double counting.
+    /// A complete nonnegative cumulative checkpoint can pair legacy and explicit carriers.
+    /// Per-response usage values alone never establish response identity.
     /// </summary>
-    private static string ResponseSampleKey(JsonElement usage) => string.Create(
-        CultureInfo.InvariantCulture,
-        $"{GetLong(usage, "input_tokens")}:{GetLong(usage, "cached_input_tokens")}:"
-        + $"{GetLong(usage, "output_tokens")}:{GetLong(usage, "total_tokens")}");
+    private static string? CumulativeSampleKey(JsonElement usage) => usage.ValueKind == JsonValueKind.Object
+        && TryGetLong(usage, "input_tokens") is long input && input >= 0
+        && TryGetLong(usage, "cached_input_tokens") is long cached && cached >= 0 && cached <= input
+        && TryGetLong(usage, "output_tokens") is long output && output >= 0
+        && TryGetLong(usage, "total_tokens") is long total && total >= 0
+            ? string.Create(CultureInfo.InvariantCulture, $"{input}:{cached}:{output}:{total}") : null;
 
     /// <summary>True when two usage objects carry the same official counts.</summary>
     private static bool UsageEquals(JsonElement left, JsonElement right) =>

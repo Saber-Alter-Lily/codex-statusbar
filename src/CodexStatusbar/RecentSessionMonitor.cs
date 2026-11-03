@@ -6,7 +6,11 @@ namespace CodexStatusbar;
 
 internal sealed record RecentSessionMetric(
     string ThreadId, bool IsCurrent, double? Tps, double? TtftMs,
-    long TotalTokens, string State, DateTime LastWriteUtc, bool Readable)
+    long TotalTokens, string State, DateTime LastWriteUtc, bool Readable,
+    long InputTokens = 0, long OutputTokens = 0, long CachedInputTokens = 0,
+    long? TurnInputTokens = null, long? TurnCachedInputTokens = null, long? TurnOutputTokens = null,
+    double? LastTurnTps = null, bool Streaming = false, DateTime? LastUsageAtUtc = null,
+    bool UsageBreakdownKnown = false)
 {
     // Local UI only. Never send this row to debug diagnostics or persist it.
     public string MenuText => $"{OverlayPresentationBuilder.ShortThreadId(ThreadId)}{(IsCurrent ? " [当前]" : "")}"
@@ -33,6 +37,7 @@ internal sealed class RecentSessionMonitor
     private readonly object _queueLock = new();
     private readonly Queue<string> _pending = new();
     private readonly HashSet<string> _queued = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _seeded = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastPoll = DateTime.MinValue;
     private int _cursor;
@@ -47,6 +52,8 @@ internal sealed class RecentSessionMonitor
         public RolloutReader Reader { get; } = reader;
         public DateTime LastSeen { get; set; } = seen;
         public DateTime LastWrite { get; set; } = DateTime.MinValue;
+        public DateTime LastFileWrite { get; set; } = DateTime.MinValue;
+        public long LastOffset { get; set; } = -1;
         public bool Readable { get; set; }
     }
 
@@ -73,6 +80,15 @@ internal sealed class RecentSessionMonitor
     }
 
     public void MarkDiscoveryIncomplete() { lock (_queueLock) DiscoveryIncomplete = true; }
+
+    public void SeedPath(string path)
+    {
+        lock (_queueLock)
+        {
+            if (_seeded.Count < MaximumSessions) _seeded.Add(path);
+        }
+        ObservePath(path);
+    }
 
     public IReadOnlyList<RecentSessionMetric> Poll(string? currentPath, string? currentThread)
     {
@@ -121,8 +137,10 @@ internal sealed class RecentSessionMonitor
         try
         {
             var write = File.GetLastWriteTimeUtc(path);
+            bool seeded;
+            lock (_queueLock) seeded = _seeded.Remove(path);
             if (!_entries.ContainsKey(id) && !id.Equals(currentThread, StringComparison.OrdinalIgnoreCase)
-                && now - write > RetainFor) return; // Old queued events must not resurrect expired history.
+                && now - write > RetainFor && !seeded) return; // Only the bounded startup seed may load older history.
             if (!_entries.TryGetValue(id, out var entry) || !entry.Path.Equals(path, StringComparison.OrdinalIgnoreCase))
             {
                 // A changed file may be older than an already observed rollout for this thread.
@@ -142,9 +160,12 @@ internal sealed class RecentSessionMonitor
             {
                 entry.Reader.Initialize();
             }
-            if (write != entry.LastWrite || id.Equals(currentThread, StringComparison.OrdinalIgnoreCase))
+            if (write != entry.LastFileWrite || entry.LastOffset != entry.Reader.Offset
+                || id.Equals(currentThread, StringComparison.OrdinalIgnoreCase))
                 entry.LastSeen = now;
-            entry.LastWrite = write;
+            entry.LastFileWrite = write;
+            entry.LastOffset = entry.Reader.Offset;
+            entry.LastWrite = entry.Reader.State.LastMetadataAtUtc ?? write;
             entry.Readable = entry.Reader.IsInitialized && entry.Reader.HeadIdentity == id;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
@@ -164,9 +185,15 @@ internal sealed class RecentSessionMonitor
             : tracker.Streaming && tracker.DisplayTps is null ? "等待本轮数据"
             : tracker.Streaming ? "生成中（已观测）" : "已结束/空闲（保留值）";
         return new RecentSessionMetric(entry.Id, entry.Id.Equals(currentThread, StringComparison.OrdinalIgnoreCase),
-            entry.Readable && !stale ? tracker.DisplayTps : null,
+            entry.Readable && !stale && tracker.Streaming
+                && MonitoringStatus.IsFresh(entry.Reader.State.LastUsageAtUtc ?? entry.LastWrite, now) ? tracker.DisplayTps : null,
             entry.Readable ? tracker.TtftMs : null,
-            entry.Readable ? entry.Reader.State.TotalTokens : 0, state, entry.LastWrite, entry.Readable);
+            entry.Readable ? entry.Reader.State.TotalTokens : 0, state, entry.LastWrite, entry.Readable,
+            entry.Reader.State.InputTokens, entry.Reader.State.OutputTokens, entry.Reader.State.CachedInputTokens,
+            entry.Reader.State.TurnInputTokens, entry.Reader.State.TurnCachedInputTokens,
+            tracker.TurnId is not null ? tracker.TurnOutputTokens : null,
+            !tracker.Streaming ? tracker.LastTurnTps ?? tracker.DisplayTps : null,
+            tracker.Streaming, entry.Reader.State.LastUsageAtUtc, entry.Reader.State.HasRolloutUsage);
     }
 
     internal static bool TryReadDesktopId(string path, out string id)

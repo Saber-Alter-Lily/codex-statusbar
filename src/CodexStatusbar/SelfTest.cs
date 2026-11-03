@@ -79,6 +79,7 @@ internal static class SelfTest
         foreach (var check in SecurityPrivacySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
         foreach (var check in PathBoundarySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
         foreach (var check in InteractionSafetySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in MonitoringSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
 
         Section("TPS state machine");
         RunStateMachine(stdout);

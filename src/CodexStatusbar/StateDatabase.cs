@@ -22,7 +22,8 @@ internal static class StateDatabase
     private const int SqliteDone = 101;
     private const int SqliteOpenReadOnly = 0x00000001;
 
-    private const string ThreadColumns = "id, title, rollout_path, tokens_used, recency_at_ms";
+    // Titles are intentionally not loaded. The panel uses short local identifiers.
+    private const string ThreadColumns = "id, NULL, rollout_path, tokens_used, recency_at_ms";
 
     public static string ResolvePath()
     {
@@ -89,13 +90,21 @@ internal static class StateDatabase
             "ORDER BY recency_at_ms DESC LIMIT 1",
             null);
 
+    public static IReadOnlyList<StateThreadRecord> TryReadRecentThreads(string databasePath) =>
+        QueryRows(databasePath, $"SELECT {ThreadColumns} FROM threads WHERE archived = 0 "
+            + "ORDER BY recency_at_ms DESC LIMIT 8", null, 8);
+
     private static StateThreadRecord? QuerySingle(string databasePath, string sql, string? parameter)
+        => QueryRows(databasePath, sql, parameter, 1).FirstOrDefault();
+
+    private static IReadOnlyList<StateThreadRecord> QueryRows(string databasePath, string sql, string? parameter, int maximum)
     {
+        var rows = new List<StateThreadRecord>();
         // Validate before any File.Exists/SQLite call: a UNC path or mapped network drive can
         // initiate outbound authentication even when the application has no networking API.
         if (!LocalPathPolicy.IsAllowedFile(databasePath))
         {
-            return null;
+            return rows;
         }
 
         IntPtr database = IntPtr.Zero;
@@ -103,18 +112,23 @@ internal static class StateDatabase
         var databasePathPointer = IntPtr.Zero;
         var sqlPointer = IntPtr.Zero;
         var parameterPointer = IntPtr.Zero;
+        var started = Environment.TickCount64;
+        SqliteProgress progress = _ => Environment.TickCount64 - started > 75 ? 1 : 0;
         try
         {
             databasePathPointer = Marshal.StringToCoTaskMemUTF8(databasePath);
             if (sqlite3_open_v2(databasePathPointer, out database, SqliteOpenReadOnly, IntPtr.Zero) != SqliteOk)
             {
-                return null;
+                return rows;
             }
+
+            _ = sqlite3_busy_timeout(database, 50);
+            sqlite3_progress_handler(database, 1000, progress, IntPtr.Zero);
 
             sqlPointer = Marshal.StringToCoTaskMemUTF8(sql);
             if (sqlite3_prepare_v2(database, sqlPointer, -1, out statement, IntPtr.Zero) != SqliteOk)
             {
-                return null;
+                return rows;
             }
 
             if (parameter is not null)
@@ -122,21 +136,20 @@ internal static class StateDatabase
                 parameterPointer = Marshal.StringToCoTaskMemUTF8(parameter);
                 if (sqlite3_bind_text(statement, 1, parameterPointer, -1, IntPtr.Zero) != SqliteOk)
                 {
-                    return null;
+                    return rows;
                 }
             }
 
-            if (sqlite3_step(statement) != SqliteRow)
+            while (rows.Count < maximum && sqlite3_step(statement) == SqliteRow)
             {
-                return null;
+                rows.Add(new StateThreadRecord(
+                    ReadText(statement, 0) ?? string.Empty,
+                    null,
+                    ReadText(statement, 2),
+                    sqlite3_column_int64(statement, 3),
+                    sqlite3_column_int64(statement, 4)));
             }
-
-            return new StateThreadRecord(
-                ReadText(statement, 0) ?? string.Empty,
-                ReadText(statement, 1),
-                ReadText(statement, 2),
-                sqlite3_column_int64(statement, 3),
-                sqlite3_column_int64(statement, 4));
+            return rows;
         }
         catch (Exception exception) when (exception is DllNotFoundException
             or EntryPointNotFoundException
@@ -144,7 +157,7 @@ internal static class StateDatabase
             or AccessViolationException)
         {
             // No usable SQLite on this machine: the overlay simply runs without the state-db fallback.
-            return null;
+            return rows;
         }
         finally
         {
@@ -157,6 +170,7 @@ internal static class StateDatabase
             {
                 _ = sqlite3_close_v2(database);
             }
+            GC.KeepAlive(progress);
 
             FreeString(databasePathPointer);
             FreeString(sqlPointer);
@@ -201,4 +215,11 @@ internal static class StateDatabase
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
     private static extern int sqlite3_close_v2(IntPtr database);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int SqliteProgress(IntPtr argument);
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    private static extern void sqlite3_progress_handler(IntPtr database, int instructions, SqliteProgress callback, IntPtr argument);
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    private static extern int sqlite3_busy_timeout(IntPtr database, int milliseconds);
 }
