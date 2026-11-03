@@ -7,18 +7,19 @@ A Windows companion status strip for Codex Desktop, derived from
 It displays token totals, cache-hit information and a model-stage speed estimate.
 The expanded details and headless output also show reported time to first token (TTFT).
 
-**Source changes only: this fork has not been built or runtime-tested.** There is no
-security certification or verified binary release. Upstream test results and performance
-claims must not be treated as validation of this fork.
+**Windows build and synthetic self-tests passed: 326 checks, zero failures.**
+This validates the tested source revision, not live Codex integration or the UI. There is
+no security certification or binary release. See the [validation record](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md).
 
-## Recent-session monitoring (source implementation)
+## Recent-session monitoring
 
 The tray now includes a recent-session list for up to eight independently tracked
 conversations, showing a local short identifier, model-stage TPS estimate, reported
 TTFT and state. It discovers the selected conversation and log changes observed since
 startup, **not all historical conversations**. Speeds are never added together; stale
-or missing data is not presented as live speed. This UI and its synthetic C# tests have
-not yet been run. See the [phase-two report](docs/MULTI_SESSION_PHASE2.zh-CN.md).
+or missing data is not presented as live speed. The synthetic C# tests have passed;
+the live UI remains unverified. See the [phase-two design report](docs/MULTI_SESSION_PHASE2.zh-CN.md)
+and the [subsequent Windows validation](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md).
 
 ## What changed
 
@@ -45,8 +46,8 @@ verification and remaining work.
 
 Windows and a compatible .NET SDK are required for building the Windows application;
 the project targets .NET 10. Review the source and use an isolated test profile before
-allowing the application to access personal sessions. Build instructions describe
-future validation; they were **not executed during this review**.
+allowing the application to access personal sessions. CI ran `dotnet build` and the
+synthetic self-test entrypoint only; the broader build/publish script below was **not run**.
 
 ```powershell
 pwsh -File build.ps1
@@ -72,7 +73,7 @@ they share startup-registration and application-state conventions.
 | `--install-startup` | Explicitly enable per-user Windows startup. |
 | `--uninstall-startup` | Disable per-user Windows startup. |
 | `--startup-status` | Inspect startup state; its output can include local executable paths. |
-| `--self-test fixtures` | Run application self-tests after building; not run in this review. |
+| `--self-test fixtures` | Run synthetic application self-tests after building; passed in isolated Windows CI. |
 | `--ipc-probe` | Inspect redacted local IPC connection/resolution status. |
 
 The application intentionally reads Codex session metadata and usage records to provide
@@ -95,8 +96,10 @@ may still expose sensitive data; do not run or share their output casually.
 ## Verification and limitations
 
 Source-only regression guards, JavaScript syntax checks and diff whitespace checks passed.
-No .NET build, C# self-test, Windows UI, registry migration or live IPC test has run.
-The new TTFT detail row still needs visual and behavioral validation.
+On Windows Server 2025 with .NET SDK 10.0.403, the tested revision built with zero warnings
+and zero errors, and all 326 synthetic checks passed. See the [run record](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md)
+for the exact commit and logs. Live Codex integration, UI, actual registry migration and
+live IPC remain untested. The new TTFT detail row still needs visual and behavioral validation.
 
 Selected and background readers now have bounded read windows; outstanding work includes
 whole-process resource limits and behavioral validation of unusually large session logs,

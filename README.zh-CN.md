@@ -6,14 +6,14 @@
 为 Windows 上的 Codex Desktop 提供状态浮条：显示 token 总量、缓存命中信息和模型阶段速度估算；
 展开详情与无界面终端输出还显示上游上报的首 token 时间（TTFT）。
 
-**目前只有源码改动，尚未构建或运行验证。** 没有安全认证或已验证的二进制发行版。
-上游历史测试成绩、性能数据不代表本分支通过验证。
+**Windows 编译及合成自测已通过：326 项检查，0 失败。**
+这只验证对应源码版本，不代表真实 Codex 接入或 UI 已验收；没有安全认证或二进制发行版。详见[验证记录](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md)。
 
-## 多会话监测（源码已实现，尚未运行）
+## 多会话监测
 
 托盘新增最多八条近期会话的列表，按会话独立显示本地短标识、模型阶段 TPS 估算、上报 TTFT 和状态。
 发现范围是当前会话及启动后观察到的日志变化，**不是全部历史会话**；不同会话速度不求和，陈旧或缺失数据不冒充实时测速。
-UI 和新增 C# 合成测试尚未执行，完整资源预算与验收边界见[第二轮报告](docs/MULTI_SESSION_PHASE2.zh-CN.md)。
+C# 合成测试已通过，真实 UI 尚未验收。资源预算见[第二轮设计报告](docs/MULTI_SESSION_PHASE2.zh-CN.md)，后续执行结果见[Windows 验证记录](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md)。
 
 ## 首轮改动
 
@@ -31,7 +31,7 @@ UI 和新增 C# 合成测试尚未执行，完整资源预算与验收边界见[
 
 构建 Windows 应用需要 Windows 和兼容的 .NET SDK；项目目标为 .NET 10。
 请先审查源码，并使用隔离的测试配置，不要直接授权读取个人会话。
-下面仅为后续验证说明，**本次审查没有执行构建或应用程序**。
+本次 CI 只执行 `dotnet build` 和合成自测入口，**没有运行下面包含发布步骤的完整脚本**。
 
 ```powershell
 pwsh -File build.ps1
@@ -54,7 +54,7 @@ pwsh -File build.ps1
 | `--install-startup` | 明确启用当前用户的 Windows 开机启动。 |
 | `--uninstall-startup` | 关闭当前用户的 Windows 开机启动。 |
 | `--startup-status` | 查看启动状态；输出可能包含本机程序路径。 |
-| `--self-test fixtures` | 构建后运行应用自测；本次未运行。 |
+| `--self-test fixtures` | 构建后运行合成自测；已在隔离 Windows CI 中通过。 |
 | `--ipc-probe` | 查看脱敏后的本地 IPC 连接与会话识别状态。 |
 
 应用为了展示指标，需要读取 Codex 会话元数据与用量记录；它不是沙箱，也不能阻止同一用户身份的
@@ -71,7 +71,8 @@ pwsh -File build.ps1
 ## 验证与限制
 
 已通过源码回退守卫、JavaScript 语法检查及 diff 空白检查。
-尚未进行 .NET 构建、C# 自测、Windows UI、注册表迁移或真实 IPC 验证；新增 TTFT 详情行仍需视觉与行为验收。
+对应源码版本已在 Windows Server 2025、.NET SDK 10.0.403 上编译，0 警告、0 错误，326 项合成自测全部通过；具体提交及日志见[验证记录](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md)。
+尚未验证真实 Codex 客户端接入、UI、实际注册表迁移或真实 IPC；TTFT 详情行仍需视觉与行为验收。
 
 选中会话及后台 reader 已采用有界读取窗口；仍需验证超大日志行为、全进程资源预算、其他开发探针、文件系统竞争条件和发布供应链。
 常规日志脱敏不会清理历史生成文件或仓库历史。
