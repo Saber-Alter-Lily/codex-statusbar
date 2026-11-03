@@ -47,13 +47,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP ("codex-statusbar-synthetic-" + [guid]::NewGuid().ToString('N'))
-          $home = Join-Path $root 'codex-home'
+          $codexHome = Join-Path $root 'codex-home'
           $temp = Join-Path $root 'temp'
           $local = Join-Path $root 'local-app-data'
           $fixtures = Join-Path $root 'fixtures'
-          $sessions = Join-Path $home 'sessions'
-          New-Item -ItemType Directory -Path $root, $home, $temp, $local, $fixtures, $sessions -Force | Out-Null
-          $env:CODEX_HOME = $home
+          $sessions = Join-Path $codexHome 'sessions'
+          New-Item -ItemType Directory -Path $root, $codexHome, $temp, $local, $fixtures, $sessions -Force | Out-Null
+          $env:CODEX_HOME = $codexHome
           $env:TEMP = $temp
           $env:TMP = $temp
           $env:LOCALAPPDATA = $local
