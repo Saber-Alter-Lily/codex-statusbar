@@ -1,0 +1,76 @@
+name: Windows synthetic tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-synthetic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-self-test:
+    if: github.repository == 'Saber-Alter-Lily/codex-statusbar' && github.event.pull_request.head.repo.full_name == 'Saber-Alter-Lily/codex-statusbar' && github.event.pull_request.head.ref == 'hardening/phase1'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+    steps:
+      - name: Check out source without persisted credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Compile only (no publish or live probes)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet build src/CodexStatusbar/CodexStatusbar.csproj --configuration Release -p:ContinuousIntegrationBuild=true
+          if ($LASTEXITCODE -ne 0) { throw "Build failed: $LASTEXITCODE" }
+
+      - name: Run synthetic self-tests in an empty isolated profile
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP ("codex-statusbar-synthetic-" + [guid]::NewGuid().ToString('N'))
+          $home = Join-Path $root 'codex-home'
+          $temp = Join-Path $root 'temp'
+          $local = Join-Path $root 'local-app-data'
+          $fixtures = Join-Path $root 'fixtures'
+          $sessions = Join-Path $home 'sessions'
+          New-Item -ItemType Directory -Path $root, $home, $temp, $local, $fixtures, $sessions -Force | Out-Null
+          $env:CODEX_HOME = $home
+          $env:TEMP = $temp
+          $env:TMP = $temp
+          $env:LOCALAPPDATA = $local
+          # No repository/user secrets are passed to the application. No app-server, IPC,
+          # startup-registration, hotkey, UI/live probe, installer or publish command runs.
+          try {
+            Copy-Item fixtures/fixture-modern.jsonl, fixtures/fixture-legacy.jsonl -Destination $fixtures
+            $dll = Join-Path $env:GITHUB_WORKSPACE 'src/CodexStatusbar/bin/Release/net10.0-windows/CodexStatusbar.dll'
+            if (-not (Test-Path -LiteralPath $dll)) { throw 'Built test entrypoint is missing' }
+            $output = & dotnet $dll --self-test $fixtures --sessions $sessions 2>&1
+            $exitCode = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            if ($exitCode -ne 0) { throw "Self-tests failed: $exitCode" }
+            if (-not ($output | Where-Object { "$_" -eq 'RESULT: PASS' })) {
+              throw 'Self-test success marker missing; refusing a false pass'
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }
