@@ -29,6 +29,10 @@ C# 合成测试已通过，真实 UI 尚未验收。资源预算见[第二轮设
 
 ## 构建与使用
 
+Windows x64 自包含**免安装测试包**见[使用说明](docs/PORTABLE_TEST.zh-CN.md)。打包工作流成功后通过
+GitHub Actions artifact 提供 ZIP，不创建正式 Release。完整解压后打开 EXE，无需另装 .NET、管理员权限或
+状态条专用账号/API key；用户最新版 Codex Desktop 的实际兼容性仍待验证。
+
 构建 Windows 应用需要 Windows 和兼容的 .NET SDK；项目目标为 .NET 10。
 请先审查源码，并使用隔离的测试配置，不要直接授权读取个人会话。
 本次 CI 只执行 `dotnet build` 和合成自测入口，**没有运行下面包含发布步骤的完整脚本**。

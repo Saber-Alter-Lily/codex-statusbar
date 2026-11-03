@@ -44,6 +44,12 @@ verification and remaining work.
 
 ## Build and use
 
+For a Windows x64 self-contained **test package**, see the [portable guide](docs/PORTABLE_TEST.zh-CN.md).
+A successful packaging workflow provides a ZIP through GitHub Actions artifacts (not a
+formal Release). Extract it before opening the EXE; no separate .NET installation,
+administrator rights or statusbar account/API key are required. Live compatibility with
+the user's latest Codex Desktop version remains unverified.
+
 Windows and a compatible .NET SDK are required for building the Windows application;
 the project targets .NET 10. Review the source and use an isolated test profile before
 allowing the application to access personal sessions. CI ran `dotnet build` and the

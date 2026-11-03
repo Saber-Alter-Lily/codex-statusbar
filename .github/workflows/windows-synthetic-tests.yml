@@ -1,4 +1,4 @@
-name: Windows synthetic tests
+name: Windows synthetic tests and portable test package
 
 on:
   pull_request:
@@ -16,7 +16,7 @@ jobs:
   build-and-self-test:
     if: github.repository == 'Saber-Alter-Lily/codex-statusbar' && github.event.pull_request.head.repo.full_name == 'Saber-Alter-Lily/codex-statusbar' && github.event.pull_request.head.ref == 'hardening/phase1'
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 25
     defaults:
       run:
         shell: pwsh
@@ -74,3 +74,21 @@ jobs:
           finally {
             Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
           }
+
+      - name: Build and verify portable test ZIP
+        timeout-minutes: 10
+        env:
+          PORTABLE_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          ./tools/build_portable_test.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'codex-statusbar-artifacts')
+
+      - name: Upload verified portable test package (not a Release)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: CodexStatusbar-win-x64-portable-test-${{ github.event.pull_request.head.sha }}
+          path: |
+            ${{ runner.temp }}/codex-statusbar-artifacts/*.zip
+            ${{ runner.temp }}/codex-statusbar-artifacts/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
