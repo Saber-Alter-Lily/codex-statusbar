@@ -29,15 +29,8 @@ if (-not $SkipTest) {
         if ($LASTEXITCODE -ne 0) { throw "self-test failed ($LASTEXITCODE)" }
         Write-Host "self-test exit code: $LASTEXITCODE"
 
-        Write-Host "`n== position model ==" -ForegroundColor Cyan
-        & $exe --position-probe (Join-Path $env:TEMP 'codex-statusbar-position-probe.json')
-        if ($LASTEXITCODE -ne 0) { throw "position probe failed ($LASTEXITCODE)" }
-
-        Write-Host "`n== hotkey ==" -ForegroundColor Cyan
-        & $exe --hotkey-probe (Join-Path $env:TEMP 'codex-statusbar-hotkey-probe.json')
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Ctrl+Alt+Shift+P could not be registered (another app may own it); the tray menu still works"
-        }
+        # Pure geometry and hotkey policy checks are included in --self-test.
+        # Live diagnostic CLI commands are intentionally disabled in this fork.
     } else {
         throw "self-test binary not found at $exe"
     }

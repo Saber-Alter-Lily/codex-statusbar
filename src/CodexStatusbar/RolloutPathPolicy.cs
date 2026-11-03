@@ -15,9 +15,12 @@ internal static class RolloutPathPolicy
             var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sessionRoot));
             var candidate = Path.GetFullPath(path);
             var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
-            if (!candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+            if (!LocalPathPolicy.IsLocalAbsolutePathSyntax(root)
+                || !LocalPathPolicy.IsLocalAbsolutePathSyntax(candidate)
+                || !candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
                 || !candidate.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)
-                || !File.Exists(candidate))
+                || !LocalPathPolicy.IsAllowedDirectory(root)
+                || !LocalPathPolicy.IsAllowedFile(candidate))
             {
                 return false;
             }
@@ -50,6 +53,25 @@ internal static class RolloutPathPolicy
         {
             return false;
         }
+    }
+
+    /// <summary>Directory discovery may inspect only local, non-linked descendants of its root.</summary>
+    public static bool IsSafeDirectory(string sessionRoot, string directory)
+    {
+        try
+        {
+            var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sessionRoot));
+            var candidate = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
+            var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
+            return LocalPathPolicy.IsLocalAbsolutePathSyntax(root)
+                && LocalPathPolicy.IsLocalAbsolutePathSyntax(candidate)
+                && (candidate.Equals(root, StringComparison.OrdinalIgnoreCase)
+                    || candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                && LocalPathPolicy.IsAllowedDirectory(root)
+                && LocalPathPolicy.IsAllowedDirectory(candidate);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException) { return false; }
     }
 
 }

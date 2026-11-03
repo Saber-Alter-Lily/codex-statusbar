@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Threading.Channels;
 
 namespace CodexStatusbar;
 
@@ -7,16 +8,29 @@ namespace CodexStatusbar;
 /// <c>--debug</c> diagnostics. Emits exactly the documented block to
 /// <c>%LOCALAPPDATA%\CodexStatusbar\debug.log</c> and, when a console is attached, to stderr.
 /// </summary>
-internal sealed class DebugDiagnostics
+internal sealed class DebugDiagnostics : IDisposable
 {
     private const int LabelWidth = 21;
 
+    internal const int MaximumBlockCharacters = 16 * 1024;
+    internal const long MaximumLogBytes = 1024 * 1024;
     private readonly object _sync = new();
+    private readonly Channel<string>? _queue;
+    private readonly Task? _writer;
+
 
     public DebugDiagnostics(bool enabled, string? logPath = null)
     {
-        Enabled = enabled;
         LogPath = logPath ?? DefaultLogPath;
+        Enabled = enabled && LocalPathPolicy.IsAllowedWritePath(LogPath);
+        if (Enabled)
+        {
+            _queue = Channel.CreateBounded<string>(new BoundedChannelOptions(32)
+            {
+                SingleReader = true, FullMode = BoundedChannelFullMode.DropWrite
+            });
+            _writer = Task.Run(DrainAsync);
+        }
     }
 
     public static string DefaultLogPath => Path.Combine(
@@ -44,34 +58,8 @@ internal sealed class DebugDiagnostics
         {
             LastBlock = block;
             BlocksWritten++;
-            try
-            {
-                var directory = Path.GetDirectoryName(LogPath);
-                if (!string.IsNullOrWhiteSpace(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-
-                File.AppendAllText(LogPath, block + Environment.NewLine, new UTF8Encoding(false));
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                // Diagnostics must never take the overlay down.
-            }
         }
-
-        if (HasConsole())
-        {
-            try
-            {
-                Console.Error.WriteLine(block);
-                Console.Error.Flush();
-            }
-            catch (IOException)
-            {
-                // Console disappeared mid-write.
-            }
-        }
+        AppendRaw(block);
     }
 
     /// <summary>
@@ -88,29 +76,47 @@ internal sealed class DebugDiagnostics
 
         // Trailing blank line: it terminates the section, so a reader (or a script) can split the log
         // into blocks without knowing every field name.
-        AppendRaw(Environment.NewLine + "[position]" + Environment.NewLine + body + Environment.NewLine);
+        AppendRaw(Environment.NewLine + "[position]" + Environment.NewLine + "details redacted" + Environment.NewLine);
     }
 
     private void AppendRaw(string text)
     {
-        lock (_sync)
+        if (Enabled && text.Length <= MaximumBlockCharacters) _queue?.Writer.TryWrite(text);
+    }
+
+    private async Task DrainAsync()
+    {
+        if (_queue is null) return;
+        await foreach (var text in _queue.Reader.ReadAllAsync())
         {
             try
             {
+                // Revalidate before every filesystem operation; this is not a handle-based sandbox.
+                if (!LocalPathPolicy.IsAllowedWritePath(LogPath)
+                    || !LocalPathPolicy.IsAllowedWritePath(LogPath + ".1")) continue;
                 var directory = Path.GetDirectoryName(LogPath);
-                if (!string.IsNullOrWhiteSpace(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-
+                if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+                if (File.Exists(LogPath) && new FileInfo(LogPath).Length
+                    + Encoding.UTF8.GetByteCount(text) + 2 > MaximumLogBytes)
+                    File.Move(LogPath, LogPath + ".1", overwrite: true);
                 File.AppendAllText(LogPath, text + Environment.NewLine, new UTF8Encoding(false));
+                if (HasConsole()) Console.Error.WriteLine(text);
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                or ArgumentException or NotSupportedException)
             {
-                // Diagnostics must never take the overlay down.
+                // Optional diagnostics are best effort, never block the UI on filesystem/console IO.
             }
         }
     }
+
+    internal async Task FlushAsync()
+    {
+        _queue?.Writer.TryComplete();
+        if (_writer is not null) await _writer;
+    }
+
+    public void Dispose() => _queue?.Writer.TryComplete();
 
     /// <summary>
     /// One timestamped lifecycle line, e.g. <c>[12:03:18] Codex process detected PID=12345</c>. These
@@ -141,7 +147,7 @@ internal sealed class DebugDiagnostics
             return;
         }
 
-        AppendRaw(Environment.NewLine + "[lifecycle]" + Environment.NewLine + body + Environment.NewLine);
+        AppendRaw(Environment.NewLine + "[lifecycle]" + Environment.NewLine + "details redacted" + Environment.NewLine);
     }
 
     /// <summary>
@@ -157,7 +163,7 @@ internal sealed class DebugDiagnostics
             return;
         }
 
-        AppendRaw(Environment.NewLine + "[position-performance]" + Environment.NewLine + body + Environment.NewLine);
+        AppendRaw(Environment.NewLine + "[position-performance]" + Environment.NewLine + "details redacted" + Environment.NewLine);
     }
 
     /// <summary>

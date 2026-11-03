@@ -21,6 +21,14 @@ or missing data is not presented as live speed. The synthetic C# tests have pass
 the live UI remains unverified. See the [phase-two design report](docs/MULTI_SESSION_PHASE2.zh-CN.md)
 and the [subsequent Windows validation](docs/WINDOWS_SYNTHETIC_VALIDATION.zh-CN.md).
 
+## Latest audit fixes
+
+See the [implementation and validation record](docs/AUDIT_FIXES.zh-CN.md). Position hotkeys
+are off by default and available only with Codex foreground after explicit opt-in. File
+inputs must be local disk paths without links; network and device paths are rejected.
+IPC requires the pipe owner to have the expected Windows Codex package identity and
+otherwise falls back to log mode. Debug writing is bounded and asynchronous.
+
 ## What changed
 
 - Windows startup is off by default and requires explicit consent. An upstream
@@ -80,12 +88,12 @@ they share startup-registration and application-state conventions.
 | `--uninstall-startup` | Disable per-user Windows startup. |
 | `--startup-status` | Inspect startup state; its output can include local executable paths. |
 | `--self-test fixtures` | Run synthetic application self-tests after building; passed in isolated Windows CI. |
-| `--ipc-probe` | Inspect redacted local IPC connection/resolution status. |
 
 The application intentionally reads Codex session metadata and usage records to provide
 its metrics. It is not a sandbox or a privacy boundary against another process running
-as the same user. Specialized developer probes beyond normal debug/IPC diagnostics
-may still expose sensitive data; do not run or share their output casually.
+as the same user. All executable diagnostic probe commands are now rejected; only
+synthetic `--self-test` remains. Reading JSONL can transiently bring message bodies into memory;
+this is not a guarantee that only counters enter the process.
 
 ## Metric semantics
 
@@ -109,7 +117,7 @@ live IPC remain untested. The new TTFT detail row still needs visual and behavio
 
 Selected and background readers now have bounded read windows; outstanding work includes
 whole-process resource limits and behavioral validation of unusually large session logs,
-audit of additional developer probes, filesystem race handling and release-chain review.
+filesystem races, actual desktop behavior and platform compatibility.
 Normal diagnostic redaction does not sanitize previously generated files or repository history.
 
 These README files were rewritten without copying upstream runtime transcripts,

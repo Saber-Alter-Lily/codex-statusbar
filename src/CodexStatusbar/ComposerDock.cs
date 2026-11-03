@@ -131,6 +131,7 @@ internal sealed class ComposerDockTracker : IDisposable
     private CancellationTokenSource? _cancellation;
     private volatile ComposerDockSnapshot _latest = ComposerDockSnapshot.Empty;
     private volatile bool _enabled = true;
+    private long _enabledGeneration;
     private long _walkCount;
     private long _fastReadCount;
     private long _lastWalkMilliseconds;
@@ -190,7 +191,20 @@ internal sealed class ComposerDockTracker : IDisposable
     public bool Enabled
     {
         get => _enabled;
-        set => _enabled = value;
+        set
+        {
+            lock (_gate)
+            {
+                if (_enabled == value) return;
+                _enabled = value;
+                Interlocked.Increment(ref _enabledGeneration);
+                if (!value)
+                {
+                    _hasCheapPath = false;
+                    Publish(ComposerDockSnapshot.Empty);
+                }
+            }
+        }
     }
 
     public long WalkCount => Interlocked.Read(ref _walkCount);
@@ -300,11 +314,25 @@ internal sealed class ComposerDockTracker : IDisposable
         var lastReferenceRect = default(IntRect);
         var walksRemaining = 2;
         var lastWalkAt = DateTime.UtcNow;
+        var retry = new ComposerDiscoveryRetry();
+        long observedGeneration = -1;
+        var observedWindow = IntPtr.Zero;
 
         while (!token.IsCancellationRequested)
         {
             try
             {
+                var generation = Interlocked.Read(ref _enabledGeneration);
+                if (generation != observedGeneration)
+                {
+                    observedGeneration = generation;
+                    observedWindow = IntPtr.Zero;
+                    reference = null;
+                    composer = null;
+                    model = null;
+                    walksRemaining = 2;
+                    retry.Reset();
+                }
                 if (!_enabled)
                 {
                     Publish(ComposerDockSnapshot.Empty);
@@ -313,6 +341,7 @@ internal sealed class ComposerDockTracker : IDisposable
                     model = null;
                     walksRemaining = 2;
                     _hasCheapPath = false;
+                    retry.Reset();
                     Sleep(token);
                     continue;
                 }
@@ -326,18 +355,31 @@ internal sealed class ComposerDockTracker : IDisposable
                     model = null;
                     walksRemaining = 2;
                     _hasCheapPath = false;
+                    observedWindow = IntPtr.Zero;
+                    retry.Reset();
                     Sleep(token);
                     continue;
                 }
 
-                var changedWindow = _latest.WindowHandle != hwnd.ToInt64();
+                var changedWindow = observedWindow != hwnd;
                 if (changedWindow)
                 {
+                    observedWindow = hwnd;
                     reference = null;
                     composer = null;
                     model = null;
                     walksRemaining = 2;
+                    retry.Reset();
+                    _hasCheapPath = false;
+                    PublishForTarget(ComposerDockSnapshot.Empty, hwnd, generation);
                 }
+
+                // A provider call already in progress cannot be preempted. Stop before the next
+                // call and reject its result if the target or enable generation changed meanwhile.
+                var budget = new ComposerDiscoveryBudget(shouldContinue: () =>
+                    !token.IsCancellationRequested && _enabled
+                    && generation == Interlocked.Read(ref _enabledGeneration)
+                    && _windowProvider() == hwnd);
 
                 // Fast path: re-read the held element only. One cross-process call instead of a walk.
                 var fastRect = default(IntRect);
@@ -345,7 +387,7 @@ internal sealed class ComposerDockTracker : IDisposable
                 var lostReference = false;
                 if (reference is not null)
                 {
-                    if (TryReadRect(reference, out fastRect))
+                    if (TryReadRect(reference, out fastRect, budget))
                     {
                         Interlocked.Increment(ref _fastReadCount);
                         Interlocked.Exchange(ref _lastReadTicks, Environment.TickCount64);
@@ -378,49 +420,63 @@ internal sealed class ComposerDockTracker : IDisposable
                     walksRemaining = 2;
                 }
 
-                if (walksRemaining > 0 || lostReference || (hadContextReference && reference is null) || composer is null)
+                if ((walksRemaining > 0 || lostReference || (hadContextReference && reference is null) || composer is null)
+                    && retry.CanAttempt(Environment.TickCount64))
                 {
                     var walkStarted = Environment.TickCount64;
-                    var snapshot = Walk(hwnd, ref composer, ref reference, ref model);
+                    var snapshot = Walk(hwnd, ref composer, ref reference, ref model, budget);
                     Interlocked.Increment(ref _walkCount);
                     Interlocked.Exchange(ref _lastWalkMilliseconds, Environment.TickCount64 - walkStarted);
                     Interlocked.Exchange(ref _lastReadTicks, Environment.TickCount64);
                     lastWalkAt = DateTime.UtcNow;
                     walksRemaining--;
                     lastReferenceRect = snapshot.ReferenceRect;
-                    Publish(snapshot);
+                    if (snapshot.Failure is not null)
+                    {
+                        retry.RecordFailure(Environment.TickCount64);
+                        walksRemaining = 1;
+                    }
+                    else
+                    {
+                        retry.Reset();
+                    }
+                    PublishForTarget(snapshot, hwnd, generation);
                 }
                 else if (!fastRect.IsEmpty)
                 {
                     lastReferenceRect = fastRect;
-                    Publish(_latest with
+                    PublishForTarget(_latest with
                     {
                         Source = ComposerReferenceSource.UiaContext,
                         ReferenceRect = fastRect,
                         WindowHandle = hwnd.ToInt64(),
                         Failure = null
-                    });
+                    }, hwnd, generation);
                 }
 
                 // The live answer to "can the next iteration be a cheap re-read". Recomputed every pass
                 // from the element the loop is actually holding.
-                _hasCheapPath = reference is not null;
+                _hasCheapPath = reference is not null && budget.CanContinue;
             }
             catch (ElementNotAvailableException)
             {
+                Publish(ComposerDockSnapshot.Empty with { Failure = "element-unavailable" });
                 _hasCheapPath = false;
                 reference = null;
                 composer = null;
                 model = null;
                 walksRemaining = 2;
+                retry.RecordFailure(Environment.TickCount64);
             }
             catch (InvalidOperationException)
             {
+                Publish(ComposerDockSnapshot.Empty with { Failure = "provider-unavailable" });
                 _hasCheapPath = false;
                 reference = null;
                 composer = null;
                 model = null;
                 walksRemaining = 2;
+                retry.RecordFailure(Environment.TickCount64);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
@@ -430,6 +486,7 @@ internal sealed class ComposerDockTracker : IDisposable
                 composer = null;
                 model = null;
                 walksRemaining = 2;
+                retry.RecordFailure(Environment.TickCount64);
                 Sleep(token);
             }
 
@@ -461,6 +518,16 @@ internal sealed class ComposerDockTracker : IDisposable
         Interlocked.Increment(ref _revision);
     }
 
+    private void PublishForTarget(ComposerDockSnapshot snapshot, IntPtr hwnd, long generation)
+    {
+        lock (_gate)
+        {
+            if (_enabled && generation == Interlocked.Read(ref _enabledGeneration)
+                && _windowProvider() == hwnd)
+                Publish(snapshot);
+        }
+    }
+
     // ------------------------------------------------------------------ the walk
 
     /// <summary>
@@ -471,8 +538,10 @@ internal sealed class ComposerDockTracker : IDisposable
         IntPtr hwnd,
         ref AutomationElement? composer,
         ref AutomationElement? reference,
-        ref AutomationElement? model)
+        ref AutomationElement? model,
+        ComposerDiscoveryBudget budget)
     {
+        if (!budget.TryOperation()) return DiscoveryLimited(hwnd, ref composer, ref reference, ref model);
         var root = AutomationElement.FromHandle(hwnd);
         if (root is null)
         {
@@ -485,12 +554,13 @@ internal sealed class ComposerDockTracker : IDisposable
         var walker = TreeWalker.ControlViewWalker;
 
         // Re-acquire the composer when the held node died.
-        if (composer is not null && !TryReadRect(composer, out _))
+        if (composer is not null && !TryReadRect(composer, out _, budget))
         {
             composer = null;
         }
 
-        composer ??= FindComposer(root, walker);
+        composer ??= FindComposer(root, walker, budget);
+        if (!budget.CanContinue) return DiscoveryLimited(hwnd, ref composer, ref reference, ref model);
         if (composer is null)
         {
             reference = null;
@@ -503,7 +573,7 @@ internal sealed class ComposerDockTracker : IDisposable
             };
         }
 
-        if (!TryReadRect(composer, out var composerRect))
+        if (!TryReadRect(composer, out var composerRect, budget))
         {
             composer = null;
             reference = null;
@@ -514,17 +584,17 @@ internal sealed class ComposerDockTracker : IDisposable
         // Enumerate the composer's direct children once: the Context indicator, the model selector
         // and the left control cluster are all read out of this single list.
         var children = new List<ChildInfo>(16);
-        var childElement = TryFirstChild(walker, composer);
+        var childElement = TryFirstChild(walker, composer, budget);
         var index = 0;
-        while (childElement is not null && index < 64)
+        while (childElement is not null && index < 64 && budget.TryVisitNode())
         {
-            if (TryReadRect(childElement, out var rect)
+            if (TryReadRect(childElement, out var rect, budget)
                 && TryReadProperties(
                     childElement,
                     out var childControlType,
                     out var childName,
                     out var childAutomationId,
-                    out var childClassName))
+                    out var childClassName, budget))
             {
                 children.Add(new ChildInfo(
                     childElement,
@@ -536,7 +606,7 @@ internal sealed class ComposerDockTracker : IDisposable
                     childClassName));
             }
 
-            childElement = TryNextSibling(walker, childElement);
+            childElement = TryNextSibling(walker, childElement, budget);
             index++;
         }
 
@@ -572,7 +642,7 @@ internal sealed class ComposerDockTracker : IDisposable
             }
         }
 
-        if (contextElement is not null && !TryReadRect(contextElement, out _))
+        if (contextElement is not null && !TryReadRect(contextElement, out _, budget))
         {
             contextElement = null;
             contextIndex = -1;
@@ -589,7 +659,8 @@ internal sealed class ComposerDockTracker : IDisposable
         var modelFound = false;
         foreach (var candidate in children)
         {
-            if (!TryExpandableButton(candidate.Element, walker, out var button, out var buttonRect))
+            if (!budget.CanContinue) break;
+            if (!TryExpandableButton(candidate.Element, walker, out var button, out var buttonRect, budget))
             {
                 continue;
             }
@@ -607,7 +678,7 @@ internal sealed class ComposerDockTracker : IDisposable
             }
         }
 
-        if (model is not null && !TryReadRect(model, out modelRect))
+        if (model is not null && !TryReadRect(model, out modelRect, budget))
         {
             model = null;
             modelFound = false;
@@ -686,6 +757,7 @@ internal sealed class ComposerDockTracker : IDisposable
             referenceRect = composerRect;
         }
 
+        if (!budget.CanContinue) return DiscoveryLimited(hwnd, ref composer, ref reference, ref model);
         return new ComposerDockSnapshot(
             source,
             referenceRect,
@@ -737,36 +809,24 @@ internal sealed class ComposerDockTracker : IDisposable
     /// AutomationId and no stable class of its own, but its editor does, and the relationship is
     /// structural rather than textual.
     /// </summary>
-    private static AutomationElement? FindComposer(AutomationElement root, TreeWalker walker)
+    private static ComposerDockSnapshot DiscoveryLimited(
+        IntPtr hwnd, ref AutomationElement? composer, ref AutomationElement? reference,
+        ref AutomationElement? model)
     {
-        var stack = new Stack<(AutomationElement Element, int Depth)>();
-        stack.Push((root, 0));
-        var visited = 0;
-        while (stack.Count > 0 && visited < 4000)
-        {
-            var (element, depth) = stack.Pop();
-            if (depth > 30)
-            {
-                continue;
-            }
-
-            var child = TryFirstChild(walker, element);
-            while (child is not null)
-            {
-                visited++;
-                if (TryReadProperties(child, out _, out _, out _, out var childClass)
-                    && string.Equals(childClass, ComposerEditorClass, StringComparison.Ordinal))
-                {
-                    return TryParent(walker, child);
-                }
-
-                stack.Push((child, depth + 1));
-                child = TryNextSibling(walker, child);
-            }
-        }
-
-        return null;
+        composer = null;
+        reference = null;
+        model = null;
+        return ComposerDockSnapshot.Empty with { WindowHandle = hwnd.ToInt64(), Failure = "discovery-budget" };
     }
+
+    private static AutomationElement? FindComposer(
+        AutomationElement root, TreeWalker walker, ComposerDiscoveryBudget budget) =>
+        ComposerDiscoverySearch.FindParent(root,
+            element => TryFirstChild(walker, element, budget),
+            element => TryNextSibling(walker, element, budget),
+            element => TryReadProperties(element, out _, out _, out _, out var childClass, budget)
+                && string.Equals(childClass, ComposerEditorClass, StringComparison.Ordinal),
+            element => TryParent(walker, element, budget), budget);
 
     /// <summary>
     /// A menu-opening button inside a composer child. The model selector's AutomationId is a
@@ -778,40 +838,42 @@ internal sealed class ComposerDockTracker : IDisposable
         AutomationElement element,
         TreeWalker walker,
         out AutomationElement button,
-        out IntRect rect)
+        out IntRect rect,
+        ComposerDiscoveryBudget budget)
     {
         button = element;
         rect = default;
-        var type = TryControlType(element);
-        if (type == "Button" && IsExpandable(element) && TryReadRect(element, out rect))
+        var type = TryControlType(element, budget);
+        if (type == "Button" && IsExpandable(element, budget) && TryReadRect(element, out rect, budget))
         {
             return true;
         }
 
         // One level down: the selector lives inside a `display: contents` group.
-        var child = TryFirstChild(walker, element);
+        var child = TryFirstChild(walker, element, budget);
         var guard = 0;
-        while (child is not null && guard < 8)
+        while (child is not null && guard < 8 && budget.TryVisitNode())
         {
-            if (string.Equals(TryControlType(child), "Button", StringComparison.Ordinal)
-                && IsExpandable(child)
-                && TryReadRect(child, out rect))
+            if (string.Equals(TryControlType(child, budget), "Button", StringComparison.Ordinal)
+                && IsExpandable(child, budget)
+                && TryReadRect(child, out rect, budget))
             {
                 button = child;
                 return true;
             }
 
-            child = TryNextSibling(walker, child);
+            child = TryNextSibling(walker, child, budget);
             guard++;
         }
 
         return false;
     }
 
-    private static bool IsExpandable(AutomationElement element)
+    private static bool IsExpandable(AutomationElement element, ComposerDiscoveryBudget? budget = null)
     {
         try
         {
+            if (budget is not null && !budget.TryOperation()) return false;
             return element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out _);
         }
         catch (ElementNotAvailableException)
@@ -829,10 +891,11 @@ internal sealed class ComposerDockTracker : IDisposable
     // Every property read crosses into the target process, so each one is individually guarded: a
     // node that disappears between two calls must degrade the snapshot, not abort the walk.
 
-    private static AutomationElement? TryFirstChild(TreeWalker walker, AutomationElement element)
+    private static AutomationElement? TryFirstChild(TreeWalker walker, AutomationElement element, ComposerDiscoveryBudget? budget = null)
     {
         try
         {
+            if (budget is not null && !budget.TryOperation()) return null;
             return walker.GetFirstChild(element);
         }
         catch (ElementNotAvailableException)
@@ -845,10 +908,11 @@ internal sealed class ComposerDockTracker : IDisposable
         }
     }
 
-    private static AutomationElement? TryNextSibling(TreeWalker walker, AutomationElement element)
+    private static AutomationElement? TryNextSibling(TreeWalker walker, AutomationElement element, ComposerDiscoveryBudget? budget = null)
     {
         try
         {
+            if (budget is not null && !budget.TryOperation()) return null;
             return walker.GetNextSibling(element);
         }
         catch (ElementNotAvailableException)
@@ -861,10 +925,11 @@ internal sealed class ComposerDockTracker : IDisposable
         }
     }
 
-    private static AutomationElement? TryParent(TreeWalker walker, AutomationElement element)
+    private static AutomationElement? TryParent(TreeWalker walker, AutomationElement element, ComposerDiscoveryBudget? budget = null)
     {
         try
         {
+            if (budget is not null && !budget.TryOperation()) return null;
             return walker.GetParent(element);
         }
         catch (ElementNotAvailableException)
@@ -877,10 +942,11 @@ internal sealed class ComposerDockTracker : IDisposable
         }
     }
 
-    private static string TryControlType(AutomationElement element)
+    private static string TryControlType(AutomationElement element, ComposerDiscoveryBudget? budget = null)
     {
         try
         {
+            if (budget is not null && !budget.TryOperation()) return string.Empty;
             return element.Current.ControlType.ProgrammaticName.Replace("ControlType.", string.Empty, StringComparison.Ordinal);
         }
         catch (ElementNotAvailableException)
@@ -898,7 +964,8 @@ internal sealed class ComposerDockTracker : IDisposable
         out string controlType,
         out string name,
         out string automationId,
-        out string className)
+        out string className,
+        ComposerDiscoveryBudget? budget = null)
     {
         controlType = string.Empty;
         name = string.Empty;
@@ -906,13 +973,17 @@ internal sealed class ComposerDockTracker : IDisposable
         className = string.Empty;
         try
         {
+            if (budget is not null && !budget.TryOperation()) return false;
             var current = element.Current;
             controlType = current.ControlType.ProgrammaticName.Replace(
                 "ControlType.",
                 string.Empty,
                 StringComparison.Ordinal);
+            if (budget is not null && !budget.TryOperation()) return false;
             name = current.Name ?? string.Empty;
+            if (budget is not null && !budget.TryOperation()) return false;
             automationId = current.AutomationId ?? string.Empty;
+            if (budget is not null && !budget.TryOperation()) return false;
             className = current.ClassName ?? string.Empty;
             return true;
         }
@@ -926,11 +997,12 @@ internal sealed class ComposerDockTracker : IDisposable
         }
     }
 
-    private static bool TryReadRect(AutomationElement element, out IntRect rect)
+    private static bool TryReadRect(AutomationElement element, out IntRect rect, ComposerDiscoveryBudget? budget = null)
     {
         rect = default;
         try
         {
+            if (budget is not null && !budget.TryOperation()) return false;
             var bounds = element.Current.BoundingRectangle;
             if (double.IsNaN(bounds.X) || double.IsInfinity(bounds.X)
                 || double.IsNaN(bounds.Y) || double.IsInfinity(bounds.Y)
@@ -958,5 +1030,97 @@ internal sealed class ComposerDockTracker : IDisposable
         {
             return false;
         }
+    }
+}
+
+/// <summary>
+/// Shared by every discovery loop and provider read. Limits are checked between calls: a single
+/// blocked UIA call cannot be forcibly interrupted, so discovery stays on one background thread.
+/// </summary>
+internal sealed class ComposerDiscoveryBudget
+{
+    internal const int MaximumNodes = 4000;
+    internal const int MaximumDepth = 30;
+    internal const int MaximumOperations = 16000;
+    internal const int MaximumMilliseconds = 250;
+    private readonly Func<long> _clock;
+    private readonly Func<bool> _shouldContinue;
+    private readonly long _started;
+    private bool _exhausted;
+    public int NodesVisited { get; private set; }
+    public int Operations { get; private set; }
+
+    public ComposerDiscoveryBudget(Func<long>? clock = null, Func<bool>? shouldContinue = null)
+    {
+        _clock = clock ?? (() => Environment.TickCount64);
+        _shouldContinue = shouldContinue ?? (() => true);
+        _started = _clock();
+    }
+
+    public bool CanContinue => !_exhausted && _shouldContinue()
+        && _clock() - _started < MaximumMilliseconds;
+
+    public bool TryVisitNode()
+    {
+        if (!CanContinue || NodesVisited >= MaximumNodes)
+        {
+            _exhausted = true;
+            return false;
+        }
+        NodesVisited++;
+        return true;
+    }
+
+    public bool TryOperation()
+    {
+        if (!CanContinue || Operations >= MaximumOperations)
+        {
+            _exhausted = true;
+            return false;
+        }
+        Operations++;
+        return true;
+    }
+}
+
+/// <summary>Pure tree traversal, also exercised using synthetic nodes without any UIA access.</summary>
+internal static class ComposerDiscoverySearch
+{
+    public static T? FindParent<T>(T root, Func<T, T?> firstChild, Func<T, T?> nextSibling,
+        Func<T, bool> isMatch, Func<T, T?> parent, ComposerDiscoveryBudget budget) where T : class
+    {
+        var stack = new Stack<(T Element, int Depth)>();
+        stack.Push((root, 0));
+        while (stack.Count > 0 && budget.CanContinue)
+        {
+            var (element, depth) = stack.Pop();
+            if (depth >= ComposerDiscoveryBudget.MaximumDepth) continue;
+            var child = firstChild(element);
+            // The same global budget covers wide sibling lists and deep branches alike.
+            while (child is not null && budget.TryVisitNode())
+            {
+                if (isMatch(child) && budget.CanContinue) return parent(child);
+                if (!budget.CanContinue) return null;
+                if (depth + 1 < ComposerDiscoveryBudget.MaximumDepth)
+                    stack.Push((child, depth + 1));
+                child = nextSibling(child);
+            }
+        }
+        return null;
+    }
+}
+
+/// <summary>Monotonic failure backoff. Resync requests never erase a failed-discovery deadline.</summary>
+internal sealed class ComposerDiscoveryRetry
+{
+    private int _failures;
+    private long _retryAt;
+    public bool CanAttempt(long now) => _failures == 0 || now >= _retryAt;
+    public void Reset() { _failures = 0; _retryAt = 0; }
+    public void RecordFailure(long now)
+    {
+        _failures = Math.Min(_failures + 1, 5);
+        var delay = Math.Min(10_000, 1000 << (_failures - 1));
+        _retryAt = now + delay;
     }
 }

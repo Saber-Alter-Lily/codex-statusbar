@@ -13,7 +13,7 @@ for token in ["MaximumSessions = 8", "MaximumPendingPaths = 64", "MaximumReadByt
               "PollInterval = TimeSpan.FromSeconds(1)", "StaleAfter = TimeSpan.FromSeconds(15)",
               "RetainFor = TimeSpan.FromMinutes(10)"]:
     check(token in recent, "resource/time bound " + token)
-check("Dictionary<string, Entry>" in recent and "new RolloutReader(path, maxTailBytes: MaximumReadBytes)" in recent,
+check("Dictionary<string, Entry>" in recent and "new RolloutReader(path, maxTailBytes: MaximumReadBytes, sessionRoot: _root)" in recent,
       "thread-keyed independent bounded readers")
 check("Directory.Enumerate" not in recent and "StateDatabase" not in recent, "no multi-session scan/DB discovery")
 check("File.Write" not in recent and "Console." not in recent and "DebugDiagnostics" not in recent,
@@ -24,7 +24,7 @@ check("entry.Readable && !stale ? tracker.DisplayTps : null" in recent, "stale/u
 check("now - write > RetainFor" in recent, "expired backlog cannot resurrect old history")
 check("new byte[64 * 1024]" in recent and "Guid.TryParse" in recent, "bounded authoritative metadata identity")
 program = read("Program.cs")
-check("new RolloutReader(path, maxTailBytes: TpsRules.TailReadBytes)" in program, "selected reader tail is also bounded")
+check("new RolloutReader(path, maxTailBytes: TpsRules.TailReadBytes, sessionRoot: _sessionRoot)" in program, "selected reader tail is also bounded")
 check("RecentSessionMonitor.TryReadDesktopId(path, out _)" in program, "selected metadata read is bounded")
 check("RecentSessions.ObservePath(path)" in program, "watcher events feed bounded discovery")
 check("_watcher.Error += (_, _) => RecentSessions.MarkDiscoveryIncomplete()" in program, "watcher overflow visible")

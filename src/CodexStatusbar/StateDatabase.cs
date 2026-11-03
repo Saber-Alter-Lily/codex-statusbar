@@ -34,7 +34,7 @@ internal static class StateDatabase
                 ".codex");
         }
 
-        return Path.Combine(codexHome, "state_5.sqlite");
+        return ResolveLocalDatabasePath(Path.Combine(codexHome, "state_5.sqlite"));
     }
 
     /// <summary>
@@ -48,14 +48,21 @@ internal static class StateDatabase
         {
             // A missing isolated database must remain missing: never consult another profile.
             // A filesystem root has no sibling database, so disable the fallback with an empty path.
+            if (!LocalPathPolicy.IsAllowedDirectory(sessionsRoot, allowMissing: true)) return string.Empty;
             var normalized = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sessionsRoot));
             var home = Path.GetDirectoryName(normalized);
             return string.IsNullOrWhiteSpace(home)
                 ? string.Empty
-                : Path.Combine(home, "state_5.sqlite");
+                : ResolveLocalDatabasePath(Path.Combine(home, "state_5.sqlite"));
         }
 
         return ResolvePath();
+    }
+
+    private static string ResolveLocalDatabasePath(string path)
+    {
+        try { return LocalPathPolicy.NormalizeLocalPath(path); }
+        catch (ArgumentException) { return string.Empty; }
     }
 
     public static StateThreadRecord? TryReadThread(string databasePath, string threadId)
@@ -84,7 +91,9 @@ internal static class StateDatabase
 
     private static StateThreadRecord? QuerySingle(string databasePath, string sql, string? parameter)
     {
-        if (!File.Exists(databasePath))
+        // Validate before any File.Exists/SQLite call: a UNC path or mapped network drive can
+        // initiate outbound authentication even when the application has no networking API.
+        if (!LocalPathPolicy.IsAllowedFile(databasePath))
         {
             return null;
         }

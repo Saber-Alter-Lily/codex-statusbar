@@ -74,6 +74,11 @@ internal static class SelfTest
         Section("bounded readers and recent-session isolation (synthetic files only)");
         foreach (var check in BoundedReaderSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
         foreach (var check in RecentSessionSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in ComposerDiscoverySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in DiscoveryIpcSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in SecurityPrivacySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in PathBoundarySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in InteractionSafetySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
 
         Section("TPS state machine");
         RunStateMachine(stdout);

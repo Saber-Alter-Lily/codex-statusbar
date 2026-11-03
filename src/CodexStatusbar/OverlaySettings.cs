@@ -149,6 +149,7 @@ internal sealed class OverlaySettings
 
         // --- v4: lifecycle / start with Windows ---
         public bool? StartWithWindows { get; set; }
+        public bool? PositionHotkeyEnabled { get; set; }
         public bool? StartupConfigured { get; set; }
         public bool? StartupOptInConfirmed { get; set; }
 
@@ -214,6 +215,7 @@ internal sealed class OverlaySettings
     /// value, so unchecking the tray item once is permanent until the user checks it again.
     /// </summary>
     public bool StartWithWindows { get; set; }
+    public bool PositionHotkeyEnabled { get; set; }
 
     /// <summary>
     /// Whether the first-run default has already been applied. Kept separately from
@@ -263,6 +265,8 @@ internal sealed class OverlaySettings
     {
         try
         {
+            if (!LocalPathPolicy.IsAllowedWritePath(path))
+                return new OverlaySettingsLoadResult(CreateDefault(), false);
             if (!File.Exists(path))
             {
                 // Write the documented schema out on first run: the file is meant to be findable and
@@ -326,6 +330,7 @@ internal sealed class OverlaySettings
 
             // Legacy startup preferences require fresh explicit consent in this fork.
             settings.StartWithWindows = persisted.StartWithWindows ?? false;
+            settings.PositionHotkeyEnabled = persisted.PositionHotkeyEnabled ?? false;
             settings.StartupConfigured = persisted.StartupConfigured ?? false;
             settings.StartupOptInConfirmed = persisted.StartupOptInConfirmed ?? false;
 
@@ -373,6 +378,7 @@ internal sealed class OverlaySettings
 
             // v4: lifecycle.
             StartWithWindows = StartWithWindows,
+            PositionHotkeyEnabled = PositionHotkeyEnabled,
             StartupConfigured = StartupConfigured,
             StartupOptInConfirmed = StartupOptInConfirmed,
 
@@ -439,6 +445,7 @@ internal sealed class OverlaySettings
         var path = settingsPath ?? DefaultSettingsPath;
         try
         {
+            if (!LocalPathPolicy.IsAllowedWritePath(path)) return false;
             var directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrWhiteSpace(directory))
             {
@@ -647,6 +654,7 @@ internal static class SettingsProbe
         var path = RequireTemporaryPath(probeCase);
         if (probeCase.Json is not null)
         {
+            if (!LocalPathPolicy.IsAllowedWritePath(path)) return false;
             var directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrWhiteSpace(directory))
             {

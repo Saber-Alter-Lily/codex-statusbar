@@ -82,7 +82,7 @@ internal sealed record CommandLineOptions(
                     throw new ArgumentException("--settings only accepts an absolute settings file path.", nameof(args));
                 }
 
-                settingsPath = Path.GetFullPath(raw);
+                settingsPath = LocalPathPolicy.NormalizeLocalPath(raw);
             }
         }
 
@@ -115,6 +115,13 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Reject removed diagnostics before command-line normalization can probe any supplied path.
+        if (args.Any(ProbeRunner.IsBlockedDiagnosticArgument))
+        {
+            Console.Error.WriteLine(ProbeRunner.DiagnosticRejectionMessage);
+            return 2;
+        }
+
         CommandLineOptions options;
         try
         {
@@ -221,7 +228,7 @@ internal static class SessionPathResolver
                 ".codex");
         }
 
-        return Path.Combine(Normalize(codexHome), "sessions");
+        return Normalize(Path.Combine(Normalize(codexHome), "sessions"));
     }
 
     public static string Normalize(string path)
@@ -235,7 +242,7 @@ internal static class SessionPathResolver
                 expanded.Length == 1 ? string.Empty : expanded[2..]);
         }
 
-        return Path.GetFullPath(expanded);
+        return LocalPathPolicy.NormalizeLocalPath(expanded);
     }
 }
 
@@ -305,7 +312,6 @@ internal sealed record ActiveThreadRouteStatus(
 /// </summary>
 internal sealed class CodexIpcActiveThreadMonitor : IDisposable
 {
-    private const int MaximumWireFrameBytes = 256 * 1024 * 1024;
     private const int MaximumJsonFrameBytes = 4 * 1024 * 1024;
     private const string SourceClientId = "codex-statusbar";
 
@@ -345,7 +351,7 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
     {
         lock (_sync)
         {
-            if (_runner is not null)
+            if (_runner is not null || Volatile.Read(ref _disposed) != 0)
             {
                 return;
             }
@@ -436,14 +442,15 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
                     PipeOptions.Asynchronous);
 
                 await pipe.ConnectAsync(2500, cancellationToken).ConfigureAwait(false);
-                FrameObserver?.Invoke("connected to \\\\.\\pipe\\codex-ipc");
+                using var verifiedServer = await AuthenticateAndInitializeAsync(pipe, cancellationToken)
+                    .ConfigureAwait(false);
+                FrameObserver?.Invoke("connected to verified Codex IPC server");
                 MarkConnected();
                 retryDelay = TimeSpan.FromMilliseconds(350);
-                await SendInitializeAsync(pipe, cancellationToken).ConfigureAwait(false);
-                FrameObserver?.Invoke("sent initialize");
 
                 while (!cancellationToken.IsCancellationRequested && pipe.IsConnected)
                 {
+                    verifiedServer.EnsureStillBound(pipe);
                     var prefix = new byte[sizeof(uint)];
                     if (!await ReadExactlyAsync(pipe, prefix, cancellationToken).ConfigureAwait(false))
                     {
@@ -451,15 +458,9 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
                     }
 
                     var frameLength = BinaryPrimitives.ReadUInt32LittleEndian(prefix);
-                    if (frameLength == 0 || frameLength > MaximumWireFrameBytes)
+                    if (frameLength == 0 || frameLength > MaximumJsonFrameBytes)
                     {
                         throw new InvalidDataException($"Invalid Codex IPC frame length: {frameLength}");
-                    }
-
-                    if (frameLength > MaximumJsonFrameBytes)
-                    {
-                        await DrainExactlyAsync(pipe, frameLength, cancellationToken).ConfigureAwait(false);
-                        continue;
                     }
 
                     var payload = new byte[(int)frameLength];
@@ -470,6 +471,8 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
 
                     try
                     {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        verifiedServer.EnsureStillBound(pipe);
                         ProcessFrame(payload);
                     }
                     catch (Exception exception) when (exception is JsonException or InvalidOperationException)
@@ -502,6 +505,27 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
             }
 
             retryDelay = TimeSpan.FromMilliseconds(Math.Min(5000, retryDelay.TotalMilliseconds * 2));
+        }
+    }
+
+    // Kept as one operation so no caller can initialize an unauthenticated endpoint. Synthetic
+    // tests call this with a random local test pipe; they never connect to the real codex-ipc name.
+    internal static async Task<CodexIpcServerIdentity.VerifiedServer> AuthenticateAndInitializeAsync(
+        NamedPipeClientStream pipe, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var server = CodexIpcServerIdentity.Authenticate(pipe);
+        try
+        {
+            server.EnsureStillBound(pipe);
+            cancellationToken.ThrowIfCancellationRequested();
+            await SendInitializeAsync(pipe, cancellationToken).ConfigureAwait(false);
+            return server;
+        }
+        catch
+        {
+            server.Dispose();
+            throw;
         }
     }
 
@@ -565,7 +589,8 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
             && sourceElement.ValueKind == JsonValueKind.String
             ? sourceElement.GetString()
             : null;
-        if (string.IsNullOrWhiteSpace(conversationId) || string.IsNullOrWhiteSpace(hostId))
+        if (string.IsNullOrWhiteSpace(conversationId) || !RolloutDiscovery.IsPlausibleThreadId(conversationId)
+            || string.IsNullOrWhiteSpace(hostId) || hostId.Length > 256 || sourceClientId?.Length > 256)
         {
             return;
         }
@@ -576,6 +601,8 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
         {
             if (followingElement.GetBoolean())
             {
+                if (!_activeByWindow.ContainsKey(key) && _activeByWindow.Count >= 64)
+                    _activeByWindow.Remove(_activeByWindow.MinBy(pair => pair.Value.Sequence).Key);
                 _activeByWindow[key] = new ActiveConversation(conversationId, ++_sequence);
             }
             else if (_activeByWindow.TryGetValue(key, out var active)
@@ -681,23 +708,6 @@ internal sealed class CodexIpcActiveThreadMonitor : IDisposable
         return true;
     }
 
-    private static async Task DrainExactlyAsync(Stream stream, uint bytesToDrain, CancellationToken cancellationToken)
-    {
-        var buffer = new byte[64 * 1024];
-        var remaining = (long)bytesToDrain;
-        while (remaining > 0)
-        {
-            var requested = (int)Math.Min(buffer.Length, remaining);
-            var read = await stream.ReadAsync(buffer.AsMemory(0, requested), cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-            {
-                throw new EndOfStreamException("Codex IPC closed before a complete frame arrived.");
-            }
-
-            remaining -= read;
-        }
-    }
-
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -728,6 +738,10 @@ internal sealed class TokenLogMonitor : IDisposable
     private readonly string _stateDatabasePath;
     private readonly FileSystemWatcher? _watcher;
     private readonly ConcurrentQueue<string> _changedPaths = new();
+    private readonly RolloutDiscovery _discovery;
+    private readonly CancellationTokenSource _disposal = new();
+    private readonly CancellationToken _disposedToken;
+    private int _disposed;
 
     private RolloutReader? _reader;
     private StateThreadRecord? _stateRecord;
@@ -746,11 +760,17 @@ internal sealed class TokenLogMonitor : IDisposable
 
     public TokenLogMonitor(string? sessionRoot = null, string? stateDatabasePath = null)
     {
-        _sessionRoot = sessionRoot ?? SessionPathResolver.Resolve();
+        _sessionRoot = LocalPathPolicy.NormalizeLocalPath(sessionRoot ?? SessionPathResolver.Resolve());
+        _disposedToken = _disposal.Token;
+        _discovery = new RolloutDiscovery((threadId, requireDesktopRoot, cancellation) =>
+            BoundedRolloutSearch.Find(_sessionRoot, threadId,
+                path => IsRolloutForThread(path, threadId, requireDesktopRoot), cancellation));
         RecentSessions = new RecentSessionMonitor(_sessionRoot);
-        _stateDatabasePath = stateDatabasePath ?? StateDatabase.ResolvePathForSessionsRoot(_sessionRoot);
+        var databasePath = stateDatabasePath ?? StateDatabase.ResolvePathForSessionsRoot(_sessionRoot);
+        _stateDatabasePath = string.IsNullOrWhiteSpace(databasePath)
+            ? string.Empty : LocalPathPolicy.NormalizeLocalPath(databasePath);
 
-        if (!Directory.Exists(_sessionRoot))
+        if (!LocalPathPolicy.IsAllowedDirectory(_sessionRoot))
         {
             return;
         }
@@ -793,39 +813,41 @@ internal sealed class TokenLogMonitor : IDisposable
 
     public TokenSnapshot? Poll(bool forceFullScan = false)
     {
-        var preferred = PreferredThreadId;
-        var hasPreferred = !string.IsNullOrWhiteSpace(preferred);
+        if (_disposedToken.IsCancellationRequested) return null;
+        try
+        {
+            _discovery.BeginPoll();
+            var preferred = PreferredThreadId;
+            var hasPreferred = !string.IsNullOrWhiteSpace(preferred);
 
-        if (PinActiveSession && hasPreferred && _selectedThreadId is null)
-        {
-            // --thread: pin immediately instead of waiting for a state-database round trip. Without
-            // this the first poll would select an unrelated conversation from the database and the
-            // pinned thread would never be read until something else changed.
-            SelectPreferredRootSession(preferred!, "forced");
-        }
-        else if (!PinActiveSession && hasPreferred)
-        {
-            SelectPreferredRootSession(preferred!, "ipc");
-        }
-        else if (PinActiveSession && _selectedThreadId is not null)
-        {
-            // Pinned to one conversation: never follow another.
-        }
-        else if (forceFullScan
-            || _selectedThreadId is null
-            || DateTime.UtcNow - _lastStateDatabaseQueryUtc > StateDatabaseRefreshInterval)
-        {
-            // No IPC route (or none yet): state_5.sqlite recency order is the documented fallback.
-            SelectFromStateDatabase();
-        }
+            if (PinActiveSession && hasPreferred && _selectedThreadId is null)
+                SelectPreferredRootSession(preferred!, "forced");
+            else if (!PinActiveSession && hasPreferred)
+                SelectPreferredRootSession(preferred!, "ipc");
+            else if (PinActiveSession && _selectedThreadId is not null)
+            {
+                // Pinned to one conversation: never follow another.
+            }
+            else if (forceFullScan || _lastStateDatabaseQueryUtc == DateTime.MinValue
+                || DateTime.UtcNow - _lastStateDatabaseQueryUtc > StateDatabaseRefreshInterval)
+                SelectFromStateDatabase();
 
-        DrainChangedPaths();
-        EnsureReader();
-        RefreshReader();
-
-        var snapshot = BuildSnapshot();
-        RecentSessions.Poll(_readerPath, _selectedThreadId);
-        return snapshot;
+            _disposedToken.ThrowIfCancellationRequested();
+            // Watcher hints can resolve a newly created file without a recursive search. Selection
+            // never searches/initializes: exactly one EnsureReader invocation belongs to each Poll.
+            DrainChangedPaths();
+            EnsureReader();
+            _disposedToken.ThrowIfCancellationRequested();
+            RefreshReader();
+            _disposedToken.ThrowIfCancellationRequested();
+            var snapshot = BuildSnapshot();
+            RecentSessions.Poll(_readerPath, _selectedThreadId);
+            return snapshot;
+        }
+        catch (OperationCanceledException) when (_disposedToken.IsCancellationRequested)
+        {
+            return null;
+        }
     }
 
     /// <summary>Reads only newly appended bytes; re-seeds from the tail when the file was replaced.</summary>
@@ -838,6 +860,11 @@ internal sealed class TokenLogMonitor : IDisposable
 
         try
         {
+            if (_readerPath is null || !IsAllowedRolloutPath(_readerPath))
+            {
+                RetireUnreadableReader();
+                return;
+            }
             if (_reader.TryUpdate() is RolloutUpdateResult.NeedsReinitialize)
             {
                 _reader.Initialize();
@@ -846,11 +873,23 @@ internal sealed class TokenLogMonitor : IDisposable
                     _baselineSource = "rollout-tail";
                 }
             }
+            if (!IsForcedPin && !string.Equals(_reader.HeadIdentity, _selectedThreadId, StringComparison.OrdinalIgnoreCase))
+                RetireUnreadableReader();
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            // Codex is rotating the file; the next poll retries.
+            RetireUnreadableReader();
         }
+    }
+
+    private void RetireUnreadableReader()
+    {
+        _reader = null;
+        _readerPath = null;
+        _baselineSource = "none";
+        _cachedSignature = null;
+        _lastSnapshot = null;
+        if (_selectedThreadId is not null) _discovery.MarkUnavailable(_selectedThreadId, !IsForcedPin);
     }
 
     private void EnsureReader()
@@ -860,7 +899,8 @@ internal sealed class TokenLogMonitor : IDisposable
             return;
         }
 
-        var path = _readerPath ?? FindRolloutPath(_selectedThreadId);
+        _disposedToken.ThrowIfCancellationRequested();
+        var path = _readerPath ?? _discovery.Resolve(_selectedThreadId, !IsForcedPin, _disposedToken);
         if (path is null)
         {
             // Brand-new empty conversation: no rollout file yet. Show "-- tok/s", "-- tok", "Cache --"
@@ -870,7 +910,14 @@ internal sealed class TokenLogMonitor : IDisposable
 
         try
         {
-            _reader = new RolloutReader(path, maxTailBytes: TpsRules.TailReadBytes);
+            if (!IsRolloutForThread(path, _selectedThreadId, !IsForcedPin))
+            {
+                _discovery.MarkUnavailable(_selectedThreadId, !IsForcedPin);
+                _readerPath = null;
+                return;
+            }
+            _disposedToken.ThrowIfCancellationRequested();
+            _reader = new RolloutReader(path, maxTailBytes: TpsRules.TailReadBytes, sessionRoot: _sessionRoot);
             _reader.Initialize();
             if (_reader.TailWasExtended)
             {
@@ -880,6 +927,7 @@ internal sealed class TokenLogMonitor : IDisposable
             }
 
             _readerPath = path;
+            _discovery.Remember(_selectedThreadId, !IsForcedPin, path);
             _baselineSource = _reader.RecoveredFromRollout ? "rollout-tail" : "none";
             if (!_reader.RecoveredFromRollout && _stateRecord is not null)
             {
@@ -895,6 +943,7 @@ internal sealed class TokenLogMonitor : IDisposable
         {
             _reader = null;
             _readerPath = null;
+            _discovery.MarkUnavailable(_selectedThreadId, !IsForcedPin);
         }
     }
 
@@ -902,6 +951,7 @@ internal sealed class TokenLogMonitor : IDisposable
 
     private void OnPathChanged(string path)
     {
+        if (_disposedToken.IsCancellationRequested) return;
         if (_changedPaths.Count < RecentSessionMonitor.MaximumPendingPaths) _changedPaths.Enqueue(path);
         RecentSessions.ObservePath(path);
     }
@@ -909,83 +959,47 @@ internal sealed class TokenLogMonitor : IDisposable
     private void DrainChangedPaths()
     {
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        while (_changedPaths.TryDequeue(out var path))
+        var remaining = RecentSessionMonitor.MaximumPendingPaths;
+        while (remaining-- > 0 && _changedPaths.TryDequeue(out var path))
         {
-            if (!visited.Add(path))
+            _disposedToken.ThrowIfCancellationRequested();
+            if (!visited.Add(path)) continue;
+            _discovery.ObservePath(path);
+            if (_reader is null && _selectedThreadId is not null
+                && path.EndsWith(_selectedThreadId + ".jsonl", StringComparison.OrdinalIgnoreCase)
+                && IsRolloutForThread(path, _selectedThreadId, !IsForcedPin))
             {
-                continue;
-            }
-
-            if (_reader is not null && path.Equals(_readerPath, StringComparison.OrdinalIgnoreCase))
-            {
-                RefreshReader();
+                _readerPath = path;
+                _discovery.Remember(_selectedThreadId, !IsForcedPin, path);
             }
             else if (_selectedThreadId is null && IsRootDesktopSession(path))
-            {
                 SwitchActiveLog(path, ExtractThreadId(path), "rollout");
-            }
         }
     }
 
     private void SelectPreferredRootSession(string threadId, string source)
     {
+        if (!RolloutDiscovery.IsPlausibleThreadId(threadId)) return;
         if (_selectedThreadId?.Equals(threadId, StringComparison.OrdinalIgnoreCase) == true)
         {
-            // Same conversation, but the caller is now the authority that selected it. Without this
-            // the source label would stay "sqlite-fallback" forever whenever the very first poll
-            // happened before the IPC connection came up — which is the common case, since connecting
-            // to the pipe is asynchronous while the state database answers immediately.
             _selectionSource = source;
-            EnsureReader();
             return;
         }
-
-        SwitchActiveLog(FindRolloutPath(threadId, requireDesktopRoot: !IsForcedPin), threadId, source);
+        // The verified record for this exact thread is cheaper and more complete than a directory
+        // search. Large historical trees may exceed discovery budgets, but this path still works.
+        var record = TryReadStateRecord(threadId);
+        var recordPath = record?.RolloutPath;
+        var path = !string.IsNullOrWhiteSpace(recordPath)
+            && IsRolloutForThread(recordPath, threadId, !IsForcedPin)
+            ? Path.GetFullPath(recordPath) : null;
+        SwitchActiveLog(path, threadId, source, record);
     }
-
-    /// <summary>Maps a thread id to its rollout file by searching ~/.codex/sessions recursively.</summary>
-    /// <param name="requireDesktopRoot">
-    /// When true (the normal case) only a root Codex Desktop session is accepted: sub-agent rollouts
-    /// replay the parent's session, and CLI/VSCode sessions are not what the strip follows. An
-    /// explicit <c>--thread</c> pin passes false, because an operator instruction to look at one
-    /// specific conversation should be honoured whatever produced it.
-    /// </param>
-    private string? FindRolloutPath(string threadId, bool requireDesktopRoot = true)
-    {
-        if (!Directory.Exists(_sessionRoot) || !IsPlausibleThreadId(threadId))
-        {
-            return null;
-        }
-
-        try
-        {
-            return Directory.EnumerateFiles(_sessionRoot, $"*{threadId}.jsonl", new EnumerationOptions
-                {
-                    RecurseSubdirectories = true,
-                    AttributesToSkip = FileAttributes.ReparsePoint,
-                    IgnoreInaccessible = true
-                })
-                .Where(IsAllowedRolloutPath)
-                .Where(path => !requireDesktopRoot || IsRootDesktopSession(path))
-                .OrderByDescending(SafeGetLastWriteUtc)
-                .FirstOrDefault();
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
-            or ArgumentException)
-        {
-            return null;
-        }
-    }
-
-    private static bool IsPlausibleThreadId(string threadId) =>
-        threadId.Length is >= 8 and <= 64
-        && threadId.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_');
 
     private void SelectFromStateDatabase()
     {
         _lastStateDatabaseQueryUtc = DateTime.UtcNow;
         var record = StateDatabase.TryReadMostRecentThread(_stateDatabasePath);
-        if (record is null || string.IsNullOrWhiteSpace(record.Id))
+        if (record is null || !RolloutDiscovery.IsPlausibleThreadId(record.Id))
         {
             return;
         }
@@ -996,9 +1010,8 @@ internal sealed class TokenLogMonitor : IDisposable
         }
 
         var path = !string.IsNullOrWhiteSpace(record.RolloutPath)
-            && IsAllowedRolloutPath(record.RolloutPath)
-            ? Path.GetFullPath(record.RolloutPath)
-            : FindRolloutPath(record.Id);
+            && IsRolloutForThread(record.RolloutPath, record.Id, requireDesktopRoot: true)
+            ? Path.GetFullPath(record.RolloutPath) : null;
         SwitchActiveLog(path, record.Id, "sqlite-fallback", record);
     }
 
@@ -1007,22 +1020,23 @@ internal sealed class TokenLogMonitor : IDisposable
     private bool IsRootDesktopSession(string path) =>
         IsAllowedRolloutPath(path) && RecentSessionMonitor.TryReadDesktopId(path, out _);
 
+    private bool IsRolloutForThread(string path, string threadId, bool requireDesktopRoot) =>
+        IsAllowedRolloutPath(path) && (!requireDesktopRoot
+            || (RecentSessionMonitor.TryReadDesktopId(path, out var id)
+                && id.Equals(threadId, StringComparison.OrdinalIgnoreCase)));
+
     private void SwitchActiveLog(string? path, string? threadId, string source, StateThreadRecord? record = null)
     {
         _selectedThreadId = threadId;
         _selectionSource = source;
-        _stateRecord = record ?? TryReadStateRecord(threadId);
+        _stateRecord = record;
         _reader = null;
         _readerPath = null;
         _baselineSource = "none";
         _cachedSignature = null;
         _lastSnapshot = null;
         ActiveSessionVersion++;
-        if (path is not null)
-        {
-            _readerPath = path;
-            EnsureReader();
-        }
+        if (path is not null) _readerPath = path;
     }
 
     private StateThreadRecord? TryReadStateRecord(string? threadId)
@@ -1068,7 +1082,8 @@ internal sealed class TokenLogMonitor : IDisposable
 
         var tps = tracker?.DisplayTps;
         var lastTurnTps = tracker?.LastTurnTps;
-        var warnings = state is null ? null : state.Warnings.ToArray();
+        var warnings = state?.Warnings.ToList() ?? [];
+        if (_discovery.DiscoveryIncomplete) warnings.Add("rollout-discovery-incomplete");
         var path = _readerPath ?? string.Empty;
 
         // The unioned model-output windows, rendered as "[start,end] [start,end]".
@@ -1111,7 +1126,7 @@ internal sealed class TokenLogMonitor : IDisposable
             lastTurnTps is null ? string.Empty : lastTurnTps.Value.ToString("0.000", CultureInfo.InvariantCulture),
             tracker?.IsHeld == true ? "1" : "0",
             _reader?.Offset.ToString(CultureInfo.InvariantCulture) ?? "0",
-            warnings is null ? string.Empty : string.Join(',', warnings),
+            string.Join(',', warnings),
             _codexInfo.ProcessId.ToString(CultureInfo.InvariantCulture),
             _codexInfo.Version,
             tracker?.StateDescription ?? "idle",
@@ -1184,7 +1199,15 @@ internal sealed class TokenLogMonitor : IDisposable
         return fileName.Length >= 36 ? fileName[^36..] : fileName;
     }
 
-    public void Dispose() => _watcher?.Dispose();
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        // Cancellation is published before stopping notifications; an active bounded search will
+        // observe it at its next filesystem operation boundary. Do not block the UI waiting for I/O.
+        _disposal.Cancel();
+        _watcher?.Dispose();
+        _disposal.Dispose();
+    }
 }
 
 /// <summary>

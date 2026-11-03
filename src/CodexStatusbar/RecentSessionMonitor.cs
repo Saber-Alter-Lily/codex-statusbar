@@ -134,7 +134,7 @@ internal sealed class RecentSessionMonitor
                     if (victim is null) return;
                     _entries.Remove(victim.Id);
                 }
-                entry = new Entry(id, path, new RolloutReader(path, maxTailBytes: MaximumReadBytes), now);
+                entry = new Entry(id, path, new RolloutReader(path, maxTailBytes: MaximumReadBytes, sessionRoot: _root), now);
                 _entries[id] = entry;
                 entry.Reader.Initialize();
             }
@@ -174,7 +174,9 @@ internal sealed class RecentSessionMonitor
         id = string.Empty;
         try
         {
+            if (!LocalPathPolicy.IsAllowedFile(path)) return false;
             using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (!LocalPathPolicy.MatchesOpenedFile(stream, path)) return false;
             var buffer = new byte[64 * 1024];
             var count = stream.Read(buffer, 0, buffer.Length);
             var newline = Array.IndexOf(buffer, (byte)'\n', 0, count);

@@ -27,19 +27,21 @@ internal sealed class RolloutReader
     private const int HeadProbeBytes = 64 * 1024;
 
     private readonly int? _maxTailBytes;
+    private readonly string? _sessionRoot;
     private int ReadBudget => _maxTailBytes ?? TpsRules.TailReadBytes;
     private bool _discardUntilNewline;
     private byte[] _pending = [];
     private string? _headIdentity;
     private bool _initialized;
 
-    public RolloutReader(string path, int? maxTailBytes = null)
+    public RolloutReader(string path, int? maxTailBytes = null, string? sessionRoot = null)
     {
         if (maxTailBytes is <= 0 || maxTailBytes > TpsRules.TailReadBytes)
         {
             throw new ArgumentOutOfRangeException(nameof(maxTailBytes));
         }
         _maxTailBytes = maxTailBytes;
+        _sessionRoot = sessionRoot;
         Path = path;
         State = new RolloutStreamState();
     }
@@ -345,15 +347,35 @@ internal sealed class RolloutReader
     {
         try
         {
-            return new FileStream(
+            // Readers are cached: a path accepted at discovery time may have been replaced by a
+            // junction or symlink since then. Recheck every open, not only reader construction.
+            if (!LocalPathPolicy.IsAllowedFile(Path)
+                || (_sessionRoot is not null && !RolloutPathPolicy.IsAllowed(_sessionRoot, Path)))
+            {
+                return null;
+            }
+            var stream = new FileStream(
                 Path,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete,
                 bufferSize: 64 * 1024,
                 FileOptions.SequentialScan);
+            try
+            {
+                if (LocalPathPolicy.MatchesOpenedFile(stream, Path)
+                    && (_sessionRoot is null || RolloutPathPolicy.IsAllowed(_sessionRoot, Path))) return stream;
+                stream.Dispose();
+                return null;
+            }
+            catch
+            {
+                stream.Dispose();
+                throw;
+            }
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException or System.Security.SecurityException)
         {
             return null;
         }

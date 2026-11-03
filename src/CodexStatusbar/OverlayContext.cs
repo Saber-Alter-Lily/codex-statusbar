@@ -104,6 +104,8 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private OverlayPresentation _presentation;
     private CodexWindowTarget? _currentTarget;
     private ManualPlacementSnapshot? _settingsSnapshotBeforeEdit;
+    private OverlayPositionMode _positionModeBeforeEdit;
+    private Point _fixedPositionBeforeEdit;
     private bool _saveFailureNotified;
     private TokenSnapshot? _lastSnapshot;
     private ToolStripMenuItem _recentSessionsMenu = null!;
@@ -351,6 +353,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _visibilityMenuItem.Text = _manuallyHidden ? "恢复显示" : "暂时隐藏";
             if (_manuallyHidden)
             {
+                UpdateInputDiscoveryGate();
                 CollapseAndHide();
             }
             else
@@ -373,6 +376,19 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         var attachNowItem = new ToolStripMenuItem("Start / Attach now  ·  立即检测并附着");
         attachNowItem.Click += (_, _) => AttachNow();
         menu.Items.Add(attachNowItem);
+
+        var hotkeyItem = new ToolStripMenuItem("Position shortcut (Codex foreground only) · 位置快捷键")
+        {
+            CheckOnClick = true,
+            Checked = _settings.PositionHotkeyEnabled
+        };
+        hotkeyItem.CheckedChanged += (_, _) =>
+        {
+            _settings.PositionHotkeyEnabled = hotkeyItem.Checked;
+            _settings.Save(_settingsPath);
+            UpdateInputDiscoveryGate();
+        };
+        menu.Items.Add(hotkeyItem);
 
         var restartItem = new ToolStripMenuItem("Restart Statusbar  ·  重启状态条");
         restartItem.Click += (_, _) => RestartOverlay();
@@ -399,8 +415,12 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _form.EditGestureCompleted += HandleEditGestureCompleted;
         _form.EditSaveRequested += (_, _) => SaveManualEditing();
         _form.EditCancelRequested += (_, _) => CancelManualEditing();
-        _hotkey.Pressed += (_, _) => ToggleManualEditing();
-        _hotkey.TryRegister();
+        _hotkey.Pressed += (_, _) =>
+        {
+            // Recheck at dispatch: focus can change after registration but before WM_HOTKEY.
+            if (_settings.PositionHotkeyEnabled && !_manuallyHidden
+                && CodexWindowLocator.TryGetForegroundCodexTarget(out _)) ToggleManualEditing();
+        };
         _menuReady = true;
         UpdateAnchorChecks();
         UpdateManualMenuState();
@@ -561,7 +581,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _settings.Save(_settingsPath);
 
             // The accessibility tree is only queried while the strip is docked.
-            _dockTracker.Enabled = mode == OverlayPositionMode.ComposerContextLeft;
+            UpdateInputDiscoveryGate();
             UpdateManualMenuState();
             if (_currentTarget is not null && !_manuallyHidden)
             {
@@ -743,7 +763,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     {
         _routeMonitor.Start();
         _monitor ??= CreateMonitor();
-        _dockTracker.Enabled = _settings.PositionMode == OverlayPositionMode.ComposerContextLeft;
+        _dockTracker.Enabled = false; // Foreground gate enables discovery on the next tick.
 
         // Everything below belonged to a previous Codex process, or to none. Clearing it here is what
         // makes "close Codex, open Codex again" behave exactly like a first attach: no old HWND, no
@@ -1282,10 +1302,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
                 .Where(argument => !argument.Equals("--restart-wait", StringComparison.OrdinalIgnoreCase))
                 .ToList();
             arguments.Add("--restart-wait");
-            Process.Start(new ProcessStartInfo(executable, string.Join(' ', arguments))
-            {
-                UseShellExecute = false
-            });
+            Process.Start(RestartArguments.Create(executable, arguments));
         }
         catch (Exception exception) when (exception is System.ComponentModel.Win32Exception
             or IOException or InvalidOperationException)
@@ -1324,8 +1341,19 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
     }
 
+    private void UpdateInputDiscoveryGate()
+    {
+        var foreground = !_manuallyHidden && _lifecycle.SubsystemsRunning
+            && CodexWindowLocator.TryGetForegroundCodexTarget(out _);
+        _dockTracker.Enabled = foreground && !_manualAttachment.IsEditing
+            && _settings.PositionMode == OverlayPositionMode.ComposerContextLeft;
+        if (foreground && _settings.PositionHotkeyEnabled) _hotkey.TryRegister();
+        else _hotkey.Unregister();
+    }
+
     private void TickCore()
     {
+        UpdateInputDiscoveryGate();
         _lifecycle.OverlayVisible = _form.Visible;
 
         // The lifecycle decides first whether anything Codex-specific runs at all this tick. While
@@ -2062,6 +2090,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
         _currentTarget = refreshedTarget;
 
+        _settingsSnapshotBeforeEdit = SnapshotFromSettings();
+        _positionModeBeforeEdit = _settings.PositionMode;
+        _fixedPositionBeforeEdit = _settings.FixedScreenPosition;
+
         // Adjusting the position means leaving the dock, so the manual attachment is seeded from where
         // the strip actually is right now. Without this the draft would resolve from whatever anchor
         // was last saved (often the old top-centre default) and the strip would jump on the first
@@ -2079,12 +2111,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _settings.PositionMode = OverlayPositionMode.FollowCodex;
             _settings.ManualPlacementEnabled = true;
             _dockTracker.Enabled = false;
-            _settings.Save(_settingsPath);
         }
 
         _interaction.CollapseForHostChange();
         StopOutsideClickPolling();
-        _settingsSnapshotBeforeEdit = SnapshotFromSettings();
         _saveFailureNotified = false;
         var transition = _manualAttachment.BeginEdit(
             _settingsSnapshotBeforeEdit,
@@ -2233,7 +2263,9 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         var cancelled = _manualAttachment.Cancel();
-        ApplySnapshotToSettings(cancelled.Draft);
+        ApplySnapshotToSettings(_settingsSnapshotBeforeEdit ?? cancelled.Draft);
+        _settings.PositionMode = _positionModeBeforeEdit;
+        _settings.FixedScreenPosition = _fixedPositionBeforeEdit;
         FinishManualEditing(restoreFocus, relayout);
     }
 
@@ -2354,6 +2386,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         if (restoreFocus
+            && (Form.ActiveForm == _form || CodexWindowLocator.TryGetForegroundCodexTarget(out _))
             && focusTarget is not null
             && CodexWindowLocator.TryRefreshKnownCodexTarget(focusTarget, out var refreshed))
         {
@@ -2587,6 +2620,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private void DisposeThemeAndForms()
     {
         _dockTracker.Dispose();
+        _debug.Dispose();
         _themeBinding.Dispose();
         _targetHighlight.Dispose();
         _form.Dispose();

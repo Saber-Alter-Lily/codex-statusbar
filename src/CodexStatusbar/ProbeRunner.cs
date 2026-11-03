@@ -18,9 +18,27 @@ internal static class ProbeRunner
     /// <summary>Process exit code for the probe that just ran; 0 unless a probe reported failure.</summary>
     public static int LastExitCode { get; private set; }
 
+    internal const string DiagnosticRejectionMessage =
+        "Diagnostic probe commands are disabled in this build. Only synthetic --self-test is available.";
+
+    internal static bool IsBlockedDiagnosticArgument(string argument) =>
+        argument.StartsWith("--", StringComparison.Ordinal)
+        && (argument.Equals("--probe", StringComparison.OrdinalIgnoreCase)
+            || argument.EndsWith("-probe", StringComparison.OrdinalIgnoreCase));
+
     public static bool TryRun(IReadOnlyList<string> args, string sessionRoot)
     {
         LastExitCode = 0;
+
+        // Reject before inspecting paths, initializing UI, connecting IPC or serializing snapshots.
+        // Check every argument so a misplaced probe flag cannot fall through into normal startup.
+        // Do not echo arguments: even a rejected command may contain private paths or identifiers.
+        if (args.Any(IsBlockedDiagnosticArgument))
+        {
+            Console.Error.WriteLine(DiagnosticRejectionMessage);
+            LastExitCode = 2;
+            return true;
+        }
 
         if (args.Count >= 1 && args[0].Equals("--self-test", StringComparison.OrdinalIgnoreCase))
         {
@@ -28,152 +46,13 @@ internal static class ProbeRunner
             return true;
         }
 
-        if (args.Count >= 1 && args[0].Equals("--ipc-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            var seconds = args.Count >= 2
-                && int.TryParse(args[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
-                && parsed > 0
-                    ? parsed
-                    : 8;
-            LastExitCode = RunIpcProbe(seconds);
-            return true;
-        }
-
-        if (args.Count >= 2 && args[0].Equals("--position-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            LastExitCode = PositionProbe.Run(args[1]);
-            return true;
-        }
-
-        if (args.Count >= 2 && args[0].Equals("--render-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            PrepareWindowProbeDpiAwareness();
-            Application.EnableVisualStyles();
-            LastExitCode = RenderProbe.Run(args[1]);
-            return true;
-        }
-
-        if (args.Count >= 2 && args[0].Equals("--show-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            PrepareWindowProbeDpiAwareness();
-            Application.EnableVisualStyles();
-            LastExitCode = RenderProbe.RunShowProbe(args[1]);
-            return true;
-        }
-
-        if (args.Count >= 2 && args[0].Equals("--hotkey-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            LastExitCode = RunHotkeyProbe(args[1]);
-            return true;
-        }
-
-        if (args.Count >= 2 && args[0].Equals("--theme-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            PrepareWindowProbeDpiAwareness();
-            WriteJson(args[1], ExecuteThemeProbe());
-            return true;
-        }
-
-        if (args.Count >= 3 && args[0].Equals("--attachment-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            WriteJson(args[1], ExecuteAttachmentProbe(args[2]));
-            return true;
-        }
-
-        if (args.Count >= 3 && args[0].Equals("--window-classification-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            var request = ReadJson<WindowClassificationProbeRequest>(args[2]);
-            WriteJson(args[1], WindowClassificationProbe.Execute(request));
-            return true;
-        }
-
-        if (args.Count >= 3 && args[0].Equals("--settings-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            var request = ReadJson<SettingsProbeRequest>(args[2]);
-            var result = SettingsProbe.Execute(request);
-            WriteJson(args[1], result);
-            return true;
-        }
-
-        if (args.Count >= 3 && args[0].Equals("--presentation-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            var request = ReadJson<PresentationProbeRequest>(args[2]);
-            var result = PresentationProbe.Execute(request);
-            WriteJson(args[1], result);
-            return true;
-        }
-
-        if (args.Count >= 3 && args[0].Equals("--layout-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            var result = ExecuteLayoutProbe(args[2]);
-            WriteJson(args[1], result);
-            return true;
-        }
-
-        if (args.Count >= 3 && args[0].Equals("--interaction-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            var request = ReadJson<InteractionProbeRequest>(args[2]);
-            var result = InteractionProbe.Execute(request);
-            WriteJson(args[1], result);
-            return true;
-        }
-
-        if (args.Count >= 3 && args[0].Equals("--form-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            PrepareWindowProbeDpiAwareness();
-            var request = ReadJson<FormProbeRequest>(args[2]);
-            var result = ExecuteFormProbe(request);
-            WriteJson(args[1], result);
-            return true;
-        }
-
-        // 窗口探针用于验证当前交互桌面可见的 Codex 顶层窗口信息。
-        if (args.Count >= 2 && args[0].Equals("--window-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            PrepareWindowProbeDpiAwareness();
-            WriteJson(args[1], CodexWindowLocator.GetForegroundWindowProbe());
-            return true;
-        }
-
-        // 线程切换探针在同一个监视器实例中验证静止日志间的路由切换。
-        if (args.Count >= 4 && args[0].Equals("--thread-switch-probe", StringComparison.OrdinalIgnoreCase))
-        {
-            using var monitor = new TokenLogMonitor(sessionRoot);
-            monitor.PreferredThreadId = args[2];
-            var first = monitor.Poll(forceFullScan: true);
-            var firstVersion = monitor.ActiveSessionVersion;
-            monitor.PreferredThreadId = args[3];
-            var second = monitor.Poll();
-            var secondVersion = monitor.ActiveSessionVersion;
-            WriteJson(args[1], new
-            {
-                FirstSnapshot = first,
-                FirstVersion = firstVersion,
-                SecondSnapshot = second,
-                SecondVersion = secondVersion
-            });
-            return true;
-        }
-
-        // 探针模式用于构建后验证真实会话日志，不启动任何界面。
-        if (args.Count >= 2 && args[0].Equals("--probe", StringComparison.OrdinalIgnoreCase))
-        {
-            using var monitor = new TokenLogMonitor(sessionRoot);
-            if (args.Count >= 3 && !args[2].StartsWith("--", StringComparison.Ordinal))
-            {
-                monitor.PreferredThreadId = args[2];
-            }
-            WriteJson(args[1], monitor.Poll(forceFullScan: true));
-            return true;
-        }
-
+        // Internal pure probe helpers remain available to synthetic tests; none has a CLI route.
         return false;
     }
 
     /// <summary>
-    /// <c>--ipc-probe [seconds]</c>: connects to <c>\\.\pipe\codex-ipc</c> and prints only redacted connection
-    /// and resolution status, never message bodies or thread identifiers. This is the diagnostic to run when
-    /// Codex is updated and the strip stops following the open conversation.
+    /// Legacy internal diagnostic retained for source compatibility. There is no CLI route to it;
+    /// production builds reject all probe switches before any IPC operation.
     /// </summary>
     private static int RunIpcProbe(int seconds)
     {
