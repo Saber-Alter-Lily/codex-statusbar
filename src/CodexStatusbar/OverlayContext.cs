@@ -55,7 +55,6 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private readonly DebugDiagnostics _debug;
     private readonly string? _forcedThreadId;
     private readonly GlobalHotkey _hotkey = new();
-    private readonly CodexThemeSource _codexTheme = new();
     private readonly ComposerDockTracker _dockTracker;
     private ComposerDockSnapshot _lastDock = ComposerDockSnapshot.Empty;
 
@@ -105,8 +104,14 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private OverlayPresentation _presentation;
     private CodexWindowTarget? _currentTarget;
     private ManualPlacementSnapshot? _settingsSnapshotBeforeEdit;
+    private OverlayPositionMode _positionModeBeforeEdit;
+    private Point _fixedPositionBeforeEdit;
     private bool _saveFailureNotified;
     private TokenSnapshot? _lastSnapshot;
+    private ToolStripMenuItem _recentSessionsMenu = null!;
+    private ToolStripMenuItem _recentSessionsCoverage = null!;
+    private readonly ToolStripMenuItem[] _recentSessionRows = new ToolStripMenuItem[RecentSessionMonitor.MaximumSessions];
+
     private bool _manuallyHidden;
     private int _pollInFlight;
     private int _disposed;
@@ -120,6 +125,14 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private string? _lastPositionSignature;
     private int _themeRefreshTicks;
     private bool _menuReady;
+    private readonly MonitoringPanelForm _panel = new();
+    private readonly EventWaitHandle _showPanelRequest = new(false, EventResetMode.AutoReset, Program.ShowPanelEventName);
+    private RegisteredWaitHandle? _showPanelWait;
+    private string? _manualThreadId;
+    private long _selectionRevision;
+    private IReadOnlyList<RecentSessionMetric> _recentMetrics = [];
+    private bool _discoveryIncomplete;
+    private DateTime? _lastSuccessfulPollUtc;
 
     public OverlayContext(
         string sessionRoot,
@@ -132,6 +145,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _settingsPath = settingsPath;
         _debug = debug ?? new DebugDiagnostics(false);
         _forcedThreadId = forcedThreadId;
+        _manualThreadId = forcedThreadId;
         _background = background;
         _positionDiagnostics = positionDiagnostics;
         _modeLabel = background ? "background" : "interactive";
@@ -141,7 +155,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _settings = OverlaySettings.Load(_settingsPath);
 
         // "Start with Windows" is reconciled once per launch, here, in both modes. This is what makes
-        // the first run of this build opt in, and what upgrades a stale Run path after the exe moves.
+        // explicit consent control persistence, and repairs a stale Run path only after opt-in.
         ApplyStartupRegistration();
 
         _lifecycle = new LifecycleController(_debug);
@@ -189,13 +203,24 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
 
         _sessionMenuItem = new ToolStripMenuItem("会话：等待数据") { Enabled = false };
         menu.Items.Add(_sessionMenuItem);
+        _recentSessionsMenu = new ToolStripMenuItem("多会话速度 · 近期观察（最多8条）");
+        _recentSessionsCoverage = new ToolStripMenuItem("仅当前及启动后变化；非全部历史会话") { Enabled = false };
+        _recentSessionsMenu.DropDownItems.Add(_recentSessionsCoverage);
+        _recentSessionsMenu.DropDownItems.Add(new ToolStripSeparator());
+        for (var index = 0; index < _recentSessionRows.Length; index++)
+        {
+            _recentSessionRows[index] = new ToolStripMenuItem("等待日志") { Enabled = false, Visible = index == 0 };
+            _recentSessionsMenu.DropDownItems.Add(_recentSessionRows[index]);
+        }
+        menu.Items.Add(_recentSessionsMenu);
+
         _pinSessionMenuItem = new ToolStripMenuItem("锁定当前会话") { Enabled = false, CheckOnClick = true };
         _pinSessionMenuItem.CheckedChanged += (_, _) =>
         {
-            if (_monitor is { } monitor)
-            {
-                monitor.PinActiveSession = _pinSessionMenuItem.Checked;
-            }
+            if (_pinSessionMenuItem.Checked && _manualThreadId is null)
+                SelectPanelSession(_lastSnapshot?.ThreadId);
+            else if (!_pinSessionMenuItem.Checked && _manualThreadId is not null)
+                SelectPanelSession(null);
 
             _pinSessionMenuItem.Text = _pinSessionMenuItem.Checked ? "已锁定当前会话" : "锁定当前会话";
         };
@@ -337,6 +362,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _visibilityMenuItem.Text = _manuallyHidden ? "恢复显示" : "暂时隐藏";
             if (_manuallyHidden)
             {
+                UpdateInputDiscoveryGate();
                 CollapseAndHide();
             }
             else
@@ -360,6 +386,19 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         attachNowItem.Click += (_, _) => AttachNow();
         menu.Items.Add(attachNowItem);
 
+        var hotkeyItem = new ToolStripMenuItem("Position shortcut (Codex foreground only) · 位置快捷键")
+        {
+            CheckOnClick = true,
+            Checked = _settings.PositionHotkeyEnabled
+        };
+        hotkeyItem.CheckedChanged += (_, _) =>
+        {
+            _settings.PositionHotkeyEnabled = hotkeyItem.Checked;
+            _settings.Save(_settingsPath);
+            UpdateInputDiscoveryGate();
+        };
+        menu.Items.Add(hotkeyItem);
+
         var restartItem = new ToolStripMenuItem("Restart Statusbar  ·  重启状态条");
         restartItem.Click += (_, _) => RestartOverlay();
         menu.Items.Add(restartItem);
@@ -369,12 +408,32 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         exitItem.Click += (_, _) => ExitOverlay();
         menu.Items.Add(exitItem);
 
+        var trayMenu = new ContextMenuStrip();
+        var openPanel = new ToolStripMenuItem("打开用量与速度面板");
+        openPanel.Click += (_, _) => ShowPanel();
+        trayMenu.Items.Add(openPanel);
+        var trayExit = new ToolStripMenuItem("退出监测");
+        trayExit.Click += (_, _) => ExitOverlay();
+        trayMenu.Items.Add(trayExit);
         _trayIcon = new NotifyIcon
         {
             Icon = SystemIcons.Information,
             Text = "Codex Token 状态条",
             Visible = true,
-            ContextMenuStrip = menu
+            ContextMenuStrip = trayMenu
+        };
+        _trayIcon.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) ShowPanel(); };
+        _panel.SessionSelected += id => SelectPanelSession(id);
+        _panel.AutoRequested += () => SelectPanelSession(null);
+        _panel.RefreshRequested += () => RequestBackgroundPoll();
+        _panel.SettingsRequested += () => menu.Show(_panel, new Point(24, 170));
+        _panel.ExitRequested += ExitOverlay;
+        _panel.StripFieldsChanged += fields =>
+        {
+            _settings.CompactFields = StripFieldRules.Sanitize(fields);
+            _settings.Save(_settingsPath);
+            RefreshPresentation();
+            if (_currentTarget is not null && !_manuallyHidden) ApplyLayout(_currentTarget);
         };
 
         _form.SetPresentation(_presentation);
@@ -385,8 +444,12 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _form.EditGestureCompleted += HandleEditGestureCompleted;
         _form.EditSaveRequested += (_, _) => SaveManualEditing();
         _form.EditCancelRequested += (_, _) => CancelManualEditing();
-        _hotkey.Pressed += (_, _) => ToggleManualEditing();
-        _hotkey.TryRegister();
+        _hotkey.Pressed += (_, _) =>
+        {
+            // Recheck at dispatch: focus can change after registration but before WM_HOTKEY.
+            if (_settings.PositionHotkeyEnabled && !_manuallyHidden
+                && CodexWindowLocator.TryGetForegroundCodexTarget(out _)) ToggleManualEditing();
+        };
         _menuReady = true;
         UpdateAnchorChecks();
         UpdateManualMenuState();
@@ -405,6 +468,45 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _positionTimer.Tick += (_, _) => OnPositionTimerTick();
 
         _timer.Start();
+        _ = _panel.Handle;
+        _showPanelWait = ThreadPool.RegisterWaitForSingleObject(_showPanelRequest, (_, _) =>
+        {
+            if (Volatile.Read(ref _disposed) == 0)
+                try { _panel.BeginInvoke((Action)ShowPanel); }
+                catch (InvalidOperationException) { }
+        }, null, Timeout.Infinite, false);
+        if (!_background) ShowPanel();
+    }
+
+    private void ShowPanel()
+    {
+        if (Volatile.Read(ref _disposed) != 0 || _panel.IsDisposed) return;
+        UpdatePanel();
+        if (_panel.WindowState == FormWindowState.Minimized) _panel.WindowState = FormWindowState.Normal;
+        _panel.Show();
+        _panel.Activate();
+    }
+
+    private void SelectPanelSession(string? id)
+    {
+        if (id is not null && !RolloutDiscovery.IsPlausibleThreadId(id)) return;
+        if (string.Equals(id, _manualThreadId, StringComparison.OrdinalIgnoreCase)) return;
+        _manualThreadId = id;
+        Interlocked.Increment(ref _selectionRevision);
+        _lastSnapshot = null;
+        _pendingSnapshot = null;
+        _pendingThreadId = null;
+        _pinSessionMenuItem.Checked = id is not null;
+        RefreshPresentation();
+        UpdatePanel();
+        RequestBackgroundPoll();
+    }
+
+    private void UpdatePanel()
+    {
+        if (_panel.IsDisposed) return;
+        _panel.Present(_lastSnapshot, _recentMetrics, _pendingRouteStatus, _manualThreadId,
+            _discoveryIncomplete, DateTime.UtcNow, _watcher.Current.Version, _lastSuccessfulPollUtc, _settings.CompactFields);
     }
 
     private void AddAnchorMenu(ToolStripMenuItem menu, string text, AnchorMode mode)
@@ -547,7 +649,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _settings.Save(_settingsPath);
 
             // The accessibility tree is only queried while the strip is docked.
-            _dockTracker.Enabled = mode == OverlayPositionMode.ComposerContextLeft;
+            UpdateInputDiscoveryGate();
             UpdateManualMenuState();
             if (_currentTarget is not null && !_manuallyHidden)
             {
@@ -637,7 +739,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             if (pair.Key == OverlayThemePreference.Auto)
             {
                 // Show what auto actually resolved to, so a mismatch is visible without opening the log.
-                pair.Value.Text = $"Auto  ·  跟随 Codex ({( _effectiveTheme == OverlayThemeKind.Light ? "Light" : "Dark")}" +
+                pair.Value.Text = $"Auto  ·  跟随 Windows ({( _effectiveTheme == OverlayThemeKind.Light ? "Light" : "Dark")}" +
                     $"，来源 {_effectiveThemeSource})";
             }
         }
@@ -676,8 +778,8 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     }
 
     /// <summary>
-    /// Reconciles <c>HKCU\...\Run</c> with the settings once per launch. The first launch of a build
-    /// that has this feature opts in; every later launch only enforces what the user chose, and
+    /// Reconciles <c>HKCU\...\Run</c> with explicit consent once per launch. First launch stays off;
+    /// legacy auto-enablement is not treated as consent. After an opt-in, it
     /// repairs the registered path if the exe has moved.
     /// </summary>
     private void ApplyStartupRegistration()
@@ -692,7 +794,6 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         var result = StartupCoordinator.Apply(_settings, _executablePath, out var changed);
         _startupRegistryEnabled = result.RegistryEnabled;
         _startupOutcome = "startup registration: " + result.Outcome
-            + (result.FirstRunOptIn ? " (first run; on by default, the tray can turn it off)" : string.Empty)
             + (result.Error is { Length: > 0 } error ? " — " + error : string.Empty);
         if (changed)
         {
@@ -730,7 +831,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     {
         _routeMonitor.Start();
         _monitor ??= CreateMonitor();
-        _dockTracker.Enabled = _settings.PositionMode == OverlayPositionMode.ComposerContextLeft;
+        _dockTracker.Enabled = false; // Foreground gate enables discovery on the next tick.
 
         // Everything below belonged to a previous Codex process, or to none. Clearing it here is what
         // makes "close Codex, open Codex again" behave exactly like a first attach: no old HWND, no
@@ -748,7 +849,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _observedRouteVersion = -1;
         _lastPositionSignature = null;
         _pinSessionMenuItem.Enabled = false;
-        _pinSessionMenuItem.Checked = false;
+        _pinSessionMenuItem.Checked = _manualThreadId is not null;
         _interaction.CollapseForHostChange();
         StopOutsideClickPolling();
         _form.Hide();
@@ -791,6 +892,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _routeMonitor.Stop();
         _monitor?.Dispose();
         _monitor = null;
+        _lastSuccessfulPollUtc = null;
+        _recentMetrics = [];
+        _discoveryIncomplete = false;
+        UpdateRecentSessionMenu([], false);
         CollapseAndHide();
         _currentTarget = null;
         _lastDock = ComposerDockSnapshot.Empty;
@@ -1268,10 +1373,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
                 .Where(argument => !argument.Equals("--restart-wait", StringComparison.OrdinalIgnoreCase))
                 .ToList();
             arguments.Add("--restart-wait");
-            Process.Start(new ProcessStartInfo(executable, string.Join(' ', arguments))
-            {
-                UseShellExecute = false
-            });
+            Process.Start(RestartArguments.Create(executable, arguments));
         }
         catch (Exception exception) when (exception is System.ComponentModel.Win32Exception
             or IOException or InvalidOperationException)
@@ -1310,8 +1412,22 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
     }
 
+    private void UpdateInputDiscoveryGate()
+    {
+        var foreground = !_manuallyHidden && _lifecycle.SubsystemsRunning
+            && CodexWindowLocator.TryGetForegroundCodexTarget(out _);
+        _dockTracker.Enabled = foreground && !_manualAttachment.IsEditing
+            && _settings.PositionMode == OverlayPositionMode.ComposerContextLeft;
+        if (foreground && _settings.PositionHotkeyEnabled) _hotkey.TryRegister();
+        else _hotkey.Unregister();
+    }
+
     private void TickCore()
     {
+        if (_panel.Visible) UpdatePanel();
+        // Freshness can expire without a counter change.
+        RefreshPresentation();
+        UpdateInputDiscoveryGate();
         _lifecycle.OverlayVisible = _form.Visible;
 
         // The lifecycle decides first whether anything Codex-specific runs at all this tick. While
@@ -1391,6 +1507,12 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         var snapshot = _pendingSnapshot;
+        if (snapshot is null && _lastSnapshot is not null)
+        {
+            _lastSnapshot = null;
+            RefreshPresentation();
+            UpdateSessionMenuText();
+        }
         if (snapshot is not null && snapshot != _lastSnapshot)
         {
             _lastSnapshot = snapshot;
@@ -1460,37 +1582,43 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         var uiScheduler = TaskScheduler.FromCurrentSynchronizationContext();
+        var selectionRevision = Interlocked.Read(ref _selectionRevision);
+        var manualThread = _manualThreadId;
         _ = Task.Run(() =>
             {
                 var routeStatus = _routeMonitor.GetStatus();
-                if (!monitor.PinActiveSession)
-                {
-                    if (!string.IsNullOrWhiteSpace(routeStatus.ThreadId))
-                    {
-                        monitor.PreferredThreadId = routeStatus.ThreadId;
-                    }
-                    else if (!routeStatus.IsConnected)
-                    {
-                        monitor.PreferredThreadId = null;
-                    }
-                }
+                monitor.ObserveRouteCandidate(routeStatus.IsConnected ? routeStatus.ThreadId : null);
+                monitor.PinActiveSession = manualThread is not null;
+                monitor.IsForcedPin = manualThread is not null && manualThread == _forcedThreadId;
+                monitor.PreferredThreadId = manualThread;
+                monitor.SelectionSource = manualThread is null ? "none" : "manual";
                 var snapshot = monitor.Poll();
                 return (
                     Snapshot: snapshot,
                     Version: monitor.ActiveSessionVersion,
                     ThreadId: monitor.ActiveThreadId,
-                    RouteStatus: routeStatus);
+                    RouteStatus: routeStatus,
+                    RecentSessions: monitor.RecentSessions.Latest,
+                    CompletedAtUtc: DateTime.UtcNow,
+                    DiscoveryIncomplete: monitor.RecentSessions.DiscoveryIncomplete);
             })
             .ContinueWith(task =>
             {
                 try
                 {
-                    if (Volatile.Read(ref _disposed) == 0 && task.Status == TaskStatus.RanToCompletion)
+                    if (Volatile.Read(ref _disposed) == 0 && ReferenceEquals(monitor, _monitor)
+                        && selectionRevision == Interlocked.Read(ref _selectionRevision)
+                        && task.Status == TaskStatus.RanToCompletion)
                     {
                         _pendingSnapshot = task.Result.Snapshot;
+                        _lastSuccessfulPollUtc = task.Result.CompletedAtUtc;
                         _pendingSessionVersion = task.Result.Version;
                         _pendingThreadId = task.Result.ThreadId;
                         _pendingRouteStatus = task.Result.RouteStatus;
+                        _recentMetrics = task.Result.RecentSessions;
+                        _discoveryIncomplete = task.Result.DiscoveryIncomplete;
+                        UpdateRecentSessionMenu(task.Result.RecentSessions, task.Result.DiscoveryIncomplete);
+                        UpdatePanel();
                     }
                 }
                 finally
@@ -1500,19 +1628,32 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             }, CancellationToken.None, TaskContinuationOptions.None, uiScheduler);
     }
 
+    private void UpdateRecentSessionMenu(IReadOnlyList<RecentSessionMetric> rows, bool discoveryIncomplete)
+    {
+        _recentSessionsCoverage.Text = discoveryIncomplete
+            ? "发现队列溢出：可能漏会话；仅当前及启动后变化"
+            : "仅当前及启动后变化；非全部历史；15秒无新记录隐藏TPS";
+        for (var index = 0; index < _recentSessionRows.Length; index++)
+        {
+            var item = _recentSessionRows[index];
+            item.Visible = index < rows.Count || index == 0;
+            item.Text = index < rows.Count ? rows[index].MenuText : "等待可读会话日志（不补猜速度）";
+        }
+    }
+
     private void RefreshPresentation()
     {
         _presentation = _lastSnapshot is null
             ? OverlayPresentationBuilder.CreateWaiting(
-                "正在寻找当前 Codex 会话…",
+                _manualThreadId is null ? MonitoringStatus.Route(_pendingRouteStatus) : "正在读取手动锁定会话…",
                 _settings.CollapsedPrimaryField,
                 _settings.CollapsedSecondaryField,
-                _settings.VisibleFields)
+                _settings.VisibleFields, _settings.CompactFields)
             : OverlayPresentationBuilder.Create(
                 _lastSnapshot,
                 _settings.CollapsedPrimaryField,
                 _settings.CollapsedSecondaryField,
-                _settings.VisibleFields);
+                _settings.VisibleFields, _settings.CompactFields);
         _form.SetPresentation(_presentation);
     }
 
@@ -1763,7 +1904,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         _presentation.ShowContextProgress,
         manualTopLeft,
         _settings.OverlayScalePercent,
-        capsuleSize,
+        capsuleSize ?? (manualTopLeft is not null ? CapsuleSizeForHost(hostWindow) : null),
         dock,
         OverlaySettings.SanitizeContextGap(_settings.ContextGapDip));
 
@@ -1962,20 +2103,23 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     /// now hugs its glyphs: resolving an anchor against the old fixed 330 DIP constant while the
     /// layout used the measured width would offset the strip by exactly the difference.
     /// </summary>
-    private Size CapsuleSizeFor(CodexWindowTarget target, int? scalePercent = null)
+    private Size CapsuleSizeFor(CodexWindowTarget target, int? scalePercent = null) =>
+        CapsuleSizeForHost(target.HostWindow, scalePercent);
+
+    private Size CapsuleSizeForHost(CodexWindowInfo host, int? scalePercent = null)
     {
         var scale = ManualAttachmentRules.SanitizeScale(scalePercent ?? _settings.OverlayScalePercent);
-        var widths = _form.MeasureCapsuleWidthsDip();
+        var widths = _form.MeasureCapsuleWidthsDip(host.Dpi);
         if (widths.Length > 0)
         {
             var variant = Math.Clamp(_form.CapsuleVariantIndex, 0, widths.Length - 1);
-            return OverlayLayoutCalculator.GetCapsuleSizeForText(widths[variant], target.HostWindow.Dpi, scale);
+            return OverlayLayoutCalculator.GetCapsuleSizeForText(widths[variant], host.Dpi, scale);
         }
 
         return OverlayLayoutCalculator.GetManualCapsuleSize(
-            target.HostWindow.Dpi,
+            host.Dpi,
             scale,
-            target.HostWindow.WorkingArea);
+            host.WorkingArea);
     }
 
     /// <summary>The capsule's real on-screen rectangle, as currently rendered.</summary>
@@ -2031,6 +2175,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
         _currentTarget = refreshedTarget;
 
+        _settingsSnapshotBeforeEdit = SnapshotFromSettings();
+        _positionModeBeforeEdit = _settings.PositionMode;
+        _fixedPositionBeforeEdit = _settings.FixedScreenPosition;
+
         // Adjusting the position means leaving the dock, so the manual attachment is seeded from where
         // the strip actually is right now. Without this the draft would resolve from whatever anchor
         // was last saved (often the old top-centre default) and the strip would jump on the first
@@ -2048,12 +2196,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _settings.PositionMode = OverlayPositionMode.FollowCodex;
             _settings.ManualPlacementEnabled = true;
             _dockTracker.Enabled = false;
-            _settings.Save(_settingsPath);
         }
 
         _interaction.CollapseForHostChange();
         StopOutsideClickPolling();
-        _settingsSnapshotBeforeEdit = SnapshotFromSettings();
         _saveFailureNotified = false;
         var transition = _manualAttachment.BeginEdit(
             _settingsSnapshotBeforeEdit,
@@ -2202,7 +2348,9 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         var cancelled = _manualAttachment.Cancel();
-        ApplySnapshotToSettings(cancelled.Draft);
+        ApplySnapshotToSettings(_settingsSnapshotBeforeEdit ?? cancelled.Draft);
+        _settings.PositionMode = _positionModeBeforeEdit;
+        _settings.FixedScreenPosition = _fixedPositionBeforeEdit;
         FinishManualEditing(restoreFocus, relayout);
     }
 
@@ -2323,6 +2471,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         }
 
         if (restoreFocus
+            && (Form.ActiveForm == _form || CodexWindowLocator.TryGetForegroundCodexTarget(out _))
             && focusTarget is not null
             && CodexWindowLocator.TryRefreshKnownCodexTarget(focusTarget, out var refreshed))
         {
@@ -2466,36 +2615,19 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         ApplyEffectiveTheme();
     }
 
-    /// <summary>
-    /// Resolves the effective palette. <c>Auto</c> follows <b>Codex's own</b> appearance setting, falling
-    /// back to the Windows app theme only when Codex has not recorded one; <c>Dark</c> / <c>Light</c>
-    /// force the text colours outright.
-    /// </summary>
+    /// <summary>Auto follows Windows; manual Dark/Light overrides never read Codex configuration.</summary>
     private void ApplyEffectiveTheme()
     {
-        var codexKind = _codexTheme.Current;
         var kind = _settings.ThemePreference switch
         {
             OverlayThemePreference.Dark => OverlayThemeKind.Dark,
             OverlayThemePreference.Light => OverlayThemeKind.Light,
-            _ => codexKind switch
-            {
-                CodexThemeKind.Light => OverlayThemeKind.Light,
-                CodexThemeKind.Dark => OverlayThemeKind.Dark,
-                _ => _autoThemePalette == OverlayThemePalette.For(OverlayThemeKind.Light)
-                    ? OverlayThemeKind.Light
-                    : OverlayThemeKind.Dark
-            }
+            _ => _autoThemePalette == OverlayThemePalette.For(OverlayThemeKind.Light)
+                ? OverlayThemeKind.Light : OverlayThemeKind.Dark
         };
-
         _effectiveTheme = kind;
         _effectiveThemeSource = _settings.ThemePreference != OverlayThemePreference.Auto
-            ? "forced"
-            : codexKind switch
-            {
-                CodexThemeKind.Light or CodexThemeKind.Dark => "Codex config",
-                _ => "Windows"
-            };
+            ? "forced" : "Windows";
 
         var palette = OverlayThemePalette.For(kind);
         _form.ApplyTheme(palette);
@@ -2503,7 +2635,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
         UpdateManualMenuState();
     }
 
-    /// <summary>Re-reads Codex's appearance setting and re-applies if it changed.</summary>
+    /// <summary>Re-applies the Windows/manual appearance if it changed.</summary>
     private void RefreshEffectiveTheme()
     {
         var previous = _effectiveTheme;
@@ -2561,6 +2693,10 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
             _hostSampler.Dispose();
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
+            _showPanelWait?.Unregister(null);
+            _showPanelRequest.Dispose();
+            _panel.CloseForExit();
+            _panel.Dispose();
             _hotkey.Dispose();
             _watcher.Dispose();
             _routeMonitor.Dispose();
@@ -2573,6 +2709,7 @@ internal sealed class OverlayContext : ApplicationContext, IFastPathTarget
     private void DisposeThemeAndForms()
     {
         _dockTracker.Dispose();
+        _debug.Dispose();
         _themeBinding.Dispose();
         _targetHighlight.Dispose();
         _form.Dispose();

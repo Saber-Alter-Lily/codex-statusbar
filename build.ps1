@@ -29,24 +29,18 @@ if (-not $SkipTest) {
         if ($LASTEXITCODE -ne 0) { throw "self-test failed ($LASTEXITCODE)" }
         Write-Host "self-test exit code: $LASTEXITCODE"
 
-        Write-Host "`n== position model ==" -ForegroundColor Cyan
-        & $exe --position-probe (Join-Path $env:TEMP 'codex-statusbar-position-probe.json')
-        if ($LASTEXITCODE -ne 0) { throw "position probe failed ($LASTEXITCODE)" }
-
-        Write-Host "`n== hotkey ==" -ForegroundColor Cyan
-        & $exe --hotkey-probe (Join-Path $env:TEMP 'codex-statusbar-hotkey-probe.json')
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Ctrl+Alt+Shift+P could not be registered (another app may own it); the tray menu still works"
-        }
+        # Pure geometry and hotkey policy checks are included in --self-test.
+        # Live diagnostic CLI commands are intentionally disabled in this fork.
     } else {
-        Write-Warning "self-test binary not found at $exe"
+        throw "self-test binary not found at $exe"
     }
 
     Write-Host "`n== fixture expectations ==" -ForegroundColor Cyan
     if (Get-Command python -ErrorAction SilentlyContinue) {
         python (Join-Path $root 'tools\make_fixtures.py')
+        if ($LASTEXITCODE -ne 0) { throw "fixture checks failed ($LASTEXITCODE)" }
     } else {
-        Write-Warning "python not found; skipped fixture checks"
+        throw "python not found; fixture checks cannot run (use -SkipTest explicitly for an unverified build)"
     }
 }
 

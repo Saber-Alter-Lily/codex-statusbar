@@ -158,6 +158,8 @@ internal sealed class TokenStripForm : Form
 
     public TokenStripForm()
     {
+        Text = "Codex 用量浮标";
+        AccessibleName = OverlayPresentationBuilder.WaitingCapsuleText;
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         TopMost = true;
@@ -441,6 +443,8 @@ internal sealed class TokenStripForm : Form
     {
         ArgumentNullException.ThrowIfNull(presentation);
         _presentation = presentation;
+        AccessibleName = presentation.CapsuleText ?? "Codex 用量浮标";
+        AccessibleDescription = presentation.StatusText;
         InvalidateSurface();
     }
 

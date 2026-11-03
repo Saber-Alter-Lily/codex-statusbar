@@ -43,7 +43,7 @@ internal static class OverlayPresentationBuilder
     private const string Separator = " · ";
 
     /// <summary>The collapsed strip before any conversation is known.</summary>
-    public const string WaitingCapsuleText = "⚡ -- tok/s · -- tok · Cache --";
+    public const string WaitingCapsuleText = "未识别 · -- tok/s · 累计-- tok · 缓存(累计)-- · TTFT--";
 
     /// <summary>
     /// The strip's verbosity ladder, widest first. Level 0 is what the user sees at normal widths —
@@ -78,7 +78,8 @@ internal static class OverlayPresentationBuilder
         string statusText,
         DisplayField primaryField,
         DisplayField secondaryField,
-        DisplayField visibleFields)
+        DisplayField visibleFields,
+        StripField compactFields = StripFieldRules.Default)
     {
         ValidateHighlightedFields(primaryField, secondaryField);
         return new OverlayPresentation(
@@ -88,15 +89,16 @@ internal static class OverlayPresentationBuilder
             0,
             false,
             SanitizeSingleLine(statusText),
-            WaitingCapsuleText,
-            BuildCapsuleVariants("--", "--", "--", hasUsage: false));
+            BuildSelectedStripVariants(null, compactFields)[0],
+            BuildSelectedStripVariants(null, compactFields));
     }
 
     public static OverlayPresentation Create(
         TokenSnapshot snapshot,
         DisplayField primaryField,
         DisplayField secondaryField,
-        DisplayField visibleFields)
+        DisplayField visibleFields,
+        StripField compactFields = StripFieldRules.Default)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         ValidateHighlightedFields(primaryField, secondaryField);
@@ -108,12 +110,12 @@ internal static class OverlayPresentationBuilder
                 visibleFields,
                 primaryField,
                 secondaryField,
-                field => CreateMetric(snapshot, field, contextPercent)),
+                field => CreateMetric(snapshot, field, contextPercent), snapshot.TtftMs),
             contextPercent,
             (visibleFields & DisplayField.ContextPercent) != 0,
-            null,
-            BuildCapsuleVariants(snapshot)[0],
-            BuildCapsuleVariants(snapshot));
+            MonitoringStatus.State(snapshot, DateTime.UtcNow),
+            BuildCapsuleVariants(snapshot, compactFields)[0],
+            BuildCapsuleVariants(snapshot, compactFields));
     }
 
     public static string FormatTokenCount(long value) => value switch
@@ -158,7 +160,7 @@ internal static class OverlayPresentationBuilder
             DisplayField.ContextPercent => "上下文百分比",
             DisplayField.Reasoning => "推理输出",
             DisplayField.Thread => "会话 ID",
-            DisplayField.Tps => "输出速度 TPS",
+            DisplayField.Tps => "模型阶段估算 TPS（含推理）",
             _ => throw new ArgumentOutOfRangeException(nameof(field), field, "不支持的展示字段。")
         };
     }
@@ -172,14 +174,50 @@ internal static class OverlayPresentationBuilder
     /// Cache renders as <c>--</c> when input is 0, never as 0% or NaN. TPS renders as <c>--</c>
     /// whenever it is unknown, and gains a leading <c>~</c> while it is a held value.
     /// </summary>
-    public static IReadOnlyList<string> BuildCapsuleVariants(TokenSnapshot snapshot)
+    public static IReadOnlyList<string> BuildCapsuleVariants(TokenSnapshot snapshot, StripField fields = StripFieldRules.Default)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
-        return BuildCapsuleVariants(
-            MetricFormat.FormatTps(snapshot.Tps, snapshot.TpsHeld),
-            MetricFormat.CompactTokens(snapshot.InputTokens + snapshot.OutputTokens),
-            MetricFormat.FormatCachePercentCompact(snapshot.InputTokens, snapshot.CachedInputTokens),
-            snapshot.HasUsage);
+        return BuildSelectedStripVariants(snapshot, fields);
+    }
+
+    private static IReadOnlyList<string> BuildSelectedStripVariants(TokenSnapshot? snapshot, StripField fields)
+    {
+        fields = StripFieldRules.Sanitize(fields);
+        var now = DateTime.UtcNow;
+        var live = snapshot is null ? null : MonitoringStatus.CurrentTps(snapshot, now);
+        var recorded = snapshot is null ? null : MonitoringStatus.RecordedTps(snapshot, now);
+        var tps = MetricFormat.FormatTps(recorded, isHeld: true);
+        var total = snapshot?.HasUsage == true ? MetricFormat.CompactTokens(snapshot.TotalTokens) : "--";
+        var cache = snapshot?.UsageBreakdownKnown == true
+            ? MetricFormat.FormatCachePercentCompact(snapshot.InputTokens, snapshot.CachedInputTokens) : "--";
+        var ttft = snapshot?.TtftMs is double latency && double.IsFinite(latency) && latency >= 0
+            ? MetricFormat.FormatSeconds(latency).Replace(" ", "", StringComparison.Ordinal) : "--";
+        var context = snapshot is { ContextUsedTokens: > 0, ContextWindowTokens: > 0 }
+            ? MetricFormat.CompactTokens(snapshot.ContextUsedTokens) + "/" + MetricFormat.CompactTokens(snapshot.ContextWindowTokens) : "--";
+        var mode = snapshot is null ? "未识别" : snapshot.Source is "manual" or "forced" ? "手动" : "会话";
+        var variants = new List<string>();
+        for (var level = 0; level < 4; level++)
+        {
+            var values = new List<string>();
+            var prefix = mode;
+            if (snapshot is not null && level < 3)
+                prefix += " " + MetricFormat.ShortThreadId(snapshot.ThreadId, level == 0 ? 10 : level == 1 ? 8 : 5);
+            if (snapshot is not null && level == 0 && !snapshot.Streaming
+                && MetricFormat.IsUsableTps(snapshot.LastTurnTps)) prefix += " · 上轮记录";
+            values.Add(prefix);
+            if (fields.HasFlag(StripField.Speed))
+                values.Add((recorded is null ? "待计数 " : snapshot?.Streaming == false ? "上轮低可信估 "
+                        : live is null ? "上次低可信估 " : "低可信估 ")
+                    + tps + (level == 0 ? " tok/s" : "t/s")
+                    + (recorded is null ? "" : " [计数" + MonitoringStatus.Age(snapshot!.LastUsageAtUtc, now).Replace(" ", "") + "]"));
+            if (fields.HasFlag(StripField.Total)) values.Add((level == 0 ? "累计" : "Σ") + total + (level == 0 ? " tok" : ""));
+            if (fields.HasFlag(StripField.CumulativeCache)) values.Add((level == 0 ? "缓存(累计)" : "缓存Σ") + cache);
+            if (fields.HasFlag(StripField.Ttft)) values.Add((snapshot?.Streaming == false && level == 0 ? "上轮TTFT" : "TTFT")
+                + ttft + (snapshot is not null && snapshot.TtftMs is null && level == 0 ? "(未上报)" : ""));
+            if (fields.HasFlag(StripField.RequestContext)) values.Add((level == 0 ? "最新请求/窗口 " : "请求/窗口") + context);
+            variants.Add(string.Join(" · ", values));
+        }
+        return variants;
     }
 
     /// <summary>The widest variant — what the strip shows whenever there is room for it.</summary>
@@ -198,13 +236,24 @@ internal static class OverlayPresentationBuilder
         DisplayField visibleFields,
         DisplayField primaryField,
         DisplayField secondaryField,
-        Func<DisplayField, OverlayMetric> createMetric)
+        Func<DisplayField, OverlayMetric> createMetric,
+        double? ttftMs = null)
     {
         return DisplayFieldRules.Ordered
             .Where(field => (visibleFields & field) != 0)
             .Where(field => field != primaryField && field != secondaryField)
             .Select(createMetric)
+            .Append(CreateTtftRow(ttftMs))
             .ToArray();
+    }
+
+    // Informational detail row only: no new persisted field/selection or compact-strip width.
+    internal static OverlayMetric CreateTtftRow(double? milliseconds)
+    {
+        var reported = milliseconds is double value && double.IsFinite(value) && value >= 0;
+        return new OverlayMetric(DisplayField.None, "TTFT", "TTFT（上报值）",
+            reported ? milliseconds!.Value.ToString("0.##", CultureInfo.InvariantCulture) + " ms"
+                : "--（未上报）", reported);
     }
 
     private static OverlayMetric CreateWaitingMetric(DisplayField field)
@@ -252,14 +301,14 @@ internal static class OverlayPresentationBuilder
             DisplayField.ContextPercent => ("上下文", "上下文占用"),
             DisplayField.Reasoning => ("推理", "推理输出"),
             DisplayField.Thread => ("会话", "会话"),
-            DisplayField.Tps => ("⚡", "输出速度"),
+            DisplayField.Tps => ("⚡", "模型阶段估算（含推理）"),
             _ => throw new ArgumentOutOfRangeException(nameof(field), field, "不支持的展示字段。")
         };
     }
 
     /// <summary>TPS cell used by the expanded panel and the tray menu: e.g. "243 tok/s", "-- tok/s".</summary>
     private static string FormatTpsValue(TokenSnapshot snapshot) =>
-        MetricFormat.FormatTps(snapshot.Tps, snapshot.TpsHeld) + " tok/s";
+        MetricFormat.FormatTps(MonitoringStatus.CurrentTps(snapshot, DateTime.UtcNow), isHeld: true) + " tok/s";
 
     private static string SanitizeSingleLine(string value)
     {

@@ -18,31 +18,41 @@ internal enum RolloutUpdateResult
 /// <summary>
 /// Offset-based incremental reader for one rollout JSONL file.
 ///
-/// Restart recovery reads only the last <see cref="TpsRules.TailReadBytes"/> bytes, then tracks
-/// appends from the byte offset where that tail read ended. Parsing is therefore O(new bytes) and
-/// sessions of 70-270 MB are never read whole. A partially written trailing line is kept for the
-/// next read and never parsed.
+/// Restart recovery reads the tail, bounded when maxTailBytes is supplied, then tracks appends
+/// from the byte offset where the read ended. A partially written trailing line is kept for the
+/// next append without rereading or duplicating its prefix.
 /// </summary>
 internal sealed class RolloutReader
 {
     private const int HeadProbeBytes = 64 * 1024;
 
+    private readonly int? _maxTailBytes;
+    private readonly string? _sessionRoot;
+    private int ReadBudget => _maxTailBytes ?? TpsRules.TailReadBytes;
+    private bool _discardUntilNewline;
     private byte[] _pending = [];
     private string? _headIdentity;
     private bool _initialized;
 
-    public RolloutReader(string path)
+    public RolloutReader(string path, int? maxTailBytes = null, string? sessionRoot = null)
     {
+        if (maxTailBytes is <= 0 || maxTailBytes > TpsRules.TailReadBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxTailBytes));
+        }
+        _maxTailBytes = maxTailBytes;
+        _sessionRoot = sessionRoot;
         Path = path;
         State = new RolloutStreamState();
     }
 
     public string Path { get; }
 
-    public RolloutStreamState State { get; }
+    public RolloutStreamState State { get; private set; }
 
-    /// <summary>Byte offset of the end of the last successfully parsed complete line.</summary>
+    /// <summary>Byte offset of the end of the last read; incomplete trailing bytes are held separately.</summary>
     public long Offset { get; private set; }
+    public long ObservedLength { get; private set; }
 
     /// <summary>Total bytes handed to the parser so far (for the debug log).</summary>
     public long ParsedBytes { get; private set; }
@@ -61,17 +71,15 @@ internal sealed class RolloutReader
     /// turn's <c>task_started</c> was inside the window, so a half-observed turn reports unknown TPS
     /// rather than 0.
     ///
-    /// The window starts at <see cref="TpsRules.TailReadBytes"/> (the bounded fast path) and is
-    /// extended backwards, doubling, until a cumulative usage reading is found or the whole file has
-    /// been covered. The window must never be assumed to be "always enough": a future Codex could
-    /// emit one enormous record, or a pathological session could hold no usable usage at all.
-    /// Extending only happens when the tail genuinely had nothing, which the 501-file corpus shows
-    /// essentially never occurs, so the usual cost stays O(4 MB).
+    /// With a maxTailBytes budget, recovery never extends beyond that window. Missing older
+    /// records stay unknown rather than causing a whole-file scan. The legacy caller without
+    /// a budget may still extend backwards until a cumulative usage record is found.
     /// </summary>
     public void Initialize()
     {
-        State.Tps.ResetTurn();
         ResetState();
+        TailWasExtended = false;
+        TailWindowBytes = ReadBudget;
 
         using var stream = OpenRead();
         if (stream is null)
@@ -81,6 +89,7 @@ internal sealed class RolloutReader
         }
 
         var length = SafeLength(stream);
+        ObservedLength = length;
         _headIdentity = ReadHeadIdentity(stream);
 
         if (length <= 0)
@@ -89,7 +98,7 @@ internal sealed class RolloutReader
             return;
         }
 
-        var window = (long)TpsRules.TailReadBytes;
+        var window = (long)ReadBudget;
         var extended = false;
 
         while (true)
@@ -104,13 +113,13 @@ internal sealed class RolloutReader
                 var firstNewline = Array.IndexOf(bytes, (byte)'\n');
                 if (firstNewline < 0)
                 {
-                    // One single record longer than the whole window. Nothing parseable in it; widen
-                    // rather than give up, unless we already have the entire file.
-                    if (tailStart == 0)
+                    // The tail starts in an oversized record. A bounded reader discards its
+                    // continuation through the next newline instead of retaining an unbounded line.
+                    if (_maxTailBytes is not null)
                     {
-                        _pending = bytes;
                         Offset = length;
-                        State.Warnings.Add("oversized-single-record");
+                        _discardUntilNewline = true;
+                        State.Warnings.Add("tail-window-limit");
                         break;
                     }
 
@@ -123,7 +132,13 @@ internal sealed class RolloutReader
             }
 
             ConsumeCompleteLines(bytes);
-            Offset = length - _pending.Length;
+            Offset = length;
+
+            if (_maxTailBytes is not null && tailStart > 0 && !State.HasCumulativeUsage)
+            {
+                State.Warnings.Add("tail-window-limit");
+                break;
+            }
 
             if (State.HasCumulativeUsage || tailStart == 0 || window >= length)
             {
@@ -143,6 +158,7 @@ internal sealed class RolloutReader
             TailWindowBytes = Math.Min(window, length);
         }
 
+        ObservedLength = length;
         _initialized = true;
     }
 
@@ -181,6 +197,7 @@ internal sealed class RolloutReader
         }
 
         var length = SafeLength(stream);
+        ObservedLength = length;
         if (length < Offset)
         {
             // Size shrank: the file was truncated or replaced. A fresh tail read is the only safe move.
@@ -200,7 +217,7 @@ internal sealed class RolloutReader
             return RolloutUpdateResult.Unchanged;
         }
 
-        if (appended > TpsRules.TailReadBytes)
+        if (appended > ReadBudget)
         {
             // Slept too long / huge burst: cheaper and bounded to re-seed from the tail.
             return RolloutUpdateResult.NeedsReinitialize;
@@ -209,26 +226,18 @@ internal sealed class RolloutReader
         var bytes = ReadRange(stream, Offset, length);
         ParsedBytes += bytes.Length;
         ConsumeCompleteLines(bytes);
-        Offset = length - _pending.Length;
+        Offset = length;
         return RolloutUpdateResult.Updated;
     }
 
     private void ResetState()
     {
-        State.InputTokens = 0;
-        State.CachedInputTokens = 0;
-        State.OutputTokens = 0;
-        State.ReasoningOutputTokens = 0;
-        State.TotalTokens = 0;
-        State.ContextUsedTokens = 0;
-        State.ContextWindowTokens = 0;
-        State.HasCumulativeUsage = false;
-        State.HasRolloutUsage = false;
-        State.CurrentTurnId = null;
-        State.Warnings.Clear();
-        State.LineCount = 0;
+        // Replacing the parser also clears dedup/carrier/session metadata, not just public counters.
+        State = new RolloutStreamState();
+        _discardUntilNewline = false;
         _pending = [];
         Offset = 0;
+        ObservedLength = 0;
         ParsedBytes = 0;
     }
 
@@ -239,6 +248,13 @@ internal sealed class RolloutReader
     /// </summary>
     private void ConsumeCompleteLines(byte[] bytes)
     {
+        if (_discardUntilNewline)
+        {
+            var newline = Array.IndexOf(bytes, (byte)'\n');
+            if (newline < 0) return;
+            bytes = bytes[(newline + 1)..];
+            _discardUntilNewline = false;
+        }
         var buffer = _pending.Length == 0 ? bytes : Concat(_pending, bytes);
         if (buffer.Length == 0)
         {
@@ -270,22 +286,30 @@ internal sealed class RolloutReader
             return;
         }
 
-        var text = Encoding.UTF8.GetString(tail).Trim();
-        if (text.Length > 0 && text.StartsWith('{') && text.EndsWith('}'))
+        if (tail.Length > ReadBudget)
         {
-            // A complete record whose trailing newline has not been flushed yet. A genuinely
-            // half-written line never parses, so it stays pending for the next read.
-            State.ObserveLine(text);
+            State.Warnings.Add("oversized-unterminated-line");
             _pending = [];
+            _discardUntilNewline = true;
             return;
         }
 
-        if (tail.Length > TpsRules.TailReadBytes)
+        var text = Encoding.UTF8.GetString(tail).Trim();
+        if (text.Length > 0 && text.StartsWith('{') && text.EndsWith('}'))
         {
-            // Defensive: an unterminated multi-megabyte fragment is garbage, not a record.
-            State.Warnings.Add("oversized-unterminated-line");
-            _pending = [];
-            return;
+            // Only consume a newline-free record once its JSON is complete. A partial record may
+            // end in a nested closing brace and still need bytes from the next append.
+            try
+            {
+                using var complete = System.Text.Json.JsonDocument.Parse(text);
+                ObserveSafely(text);
+                _pending = [];
+                return;
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                // Retain until a complete record or newline arrives, subject to the budget above.
+            }
         }
 
         _pending = tail;
@@ -293,8 +317,10 @@ internal sealed class RolloutReader
 
     private void ParseLine(byte[] buffer, int start, int count)
     {
-        if (count <= 0)
+        if (count <= 0) return;
+        if (count > ReadBudget)
         {
+            State.Warnings.Add("oversized-line");
             return;
         }
 
@@ -304,22 +330,57 @@ internal sealed class RolloutReader
             return;
         }
 
-        State.ObserveLine(line);
+        ObserveSafely(line);
+    }
+
+    private void ObserveSafely(string line)
+    {
+        try
+        {
+            State.ObserveLine(line);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+            or FormatException or OverflowException or ArgumentOutOfRangeException)
+        {
+            State.Warnings.Add("invalid-record-shape");
+            // Do not retain a potentially half-mutated timing estimate after a malformed record.
+            State.Tps.ResetTurn();
+        }
     }
 
     private FileStream? OpenRead()
     {
         try
         {
-            return new FileStream(
+            // Readers are cached: a path accepted at discovery time may have been replaced by a
+            // junction or symlink since then. Recheck every open, not only reader construction.
+            if (!LocalPathPolicy.IsAllowedFile(Path)
+                || (_sessionRoot is not null && !RolloutPathPolicy.IsAllowed(_sessionRoot, Path)))
+            {
+                return null;
+            }
+            var stream = new FileStream(
                 Path,
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete,
                 bufferSize: 64 * 1024,
                 FileOptions.SequentialScan);
+            try
+            {
+                if (LocalPathPolicy.MatchesOpenedFile(stream, Path)
+                    && (_sessionRoot is null || RolloutPathPolicy.IsAllowed(_sessionRoot, Path))) return stream;
+                stream.Dispose();
+                return null;
+            }
+            catch
+            {
+                stream.Dispose();
+                throw;
+            }
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException or System.Security.SecurityException)
         {
             return null;
         }
@@ -343,7 +404,7 @@ internal sealed class RolloutReader
         try
         {
             stream.Seek(0, SeekOrigin.Begin);
-            var probe = new byte[HeadProbeBytes];
+            var probe = new byte[Math.Min(HeadProbeBytes, ReadBudget)];
             var read = stream.Read(probe, 0, probe.Length);
             if (read <= 0)
             {
@@ -360,7 +421,8 @@ internal sealed class RolloutReader
 
             using var document = System.Text.Json.JsonDocument.Parse(firstLine);
             var root = document.RootElement;
-            if (!root.TryGetProperty("type", out var type)
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Object
+                || !root.TryGetProperty("type", out var type)
                 || type.ValueKind != System.Text.Json.JsonValueKind.String
                 || type.GetString() != "session_meta")
             {

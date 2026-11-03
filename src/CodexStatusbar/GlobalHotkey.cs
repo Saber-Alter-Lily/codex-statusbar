@@ -69,14 +69,16 @@ internal sealed class GlobalHotkey : IDisposable
         }
 
         _disposed = true;
-        if (_registered && _window is not null)
-        {
-            _ = UnregisterHotKey(_window.Handle, HotkeyId);
-        }
-
-        _registered = false;
+        Unregister();
         _window?.DestroyHandle();
         _window = null;
+    }
+
+    public void Unregister()
+    {
+        if (_registered && _window is not null)
+            _ = UnregisterHotKey(_window.Handle, HotkeyId);
+        _registered = false;
     }
 
     private void HandleHotkey() => Pressed?.Invoke(this, EventArgs.Empty);

@@ -149,11 +149,14 @@ internal sealed class OverlaySettings
 
         // --- v4: lifecycle / start with Windows ---
         public bool? StartWithWindows { get; set; }
+        public bool? PositionHotkeyEnabled { get; set; }
         public bool? StartupConfigured { get; set; }
+        public bool? StartupOptInConfirmed { get; set; }
 
         // --- v1 layout keys, still written for backward compatibility ---
         public int? AnchorMode { get; set; }
         public int? VisibleFields { get; set; }
+        public int? CompactFields { get; set; }
         public int? CollapsedPrimaryField { get; set; }
         public int? CollapsedSecondaryField { get; set; }
         public bool? ManualPlacementEnabled { get; set; }
@@ -182,6 +185,7 @@ internal sealed class OverlaySettings
     public int SettingsVersion { get; private set; }
     public AnchorMode AnchorMode { get; set; }
     public DisplayField VisibleFields { get; set; }
+    public StripField CompactFields { get; set; } = StripFieldRules.Default;
     public DisplayField CollapsedPrimaryField { get; private set; }
     public DisplayField CollapsedSecondaryField { get; private set; }
     public bool ManualPlacementEnabled { get; set; }
@@ -213,13 +217,16 @@ internal sealed class OverlaySettings
     /// value, so unchecking the tray item once is permanent until the user checks it again.
     /// </summary>
     public bool StartWithWindows { get; set; }
+    public bool PositionHotkeyEnabled { get; set; }
 
     /// <summary>
     /// Whether the first-run default has already been applied. Kept separately from
     /// <see cref="StartWithWindows"/> because "never configured" and "explicitly turned off" both
-    /// read as <c>false</c>, and only the former may be opted in on the user's behalf.
+    /// read as <c>false</c>, neither permits automatic opt-in.
     /// </summary>
     public bool StartupConfigured { get; set; }
+
+    public bool StartupOptInConfirmed { get; set; }
 
     public static OverlaySettings CreateDefault()
     {
@@ -260,6 +267,8 @@ internal sealed class OverlaySettings
     {
         try
         {
+            if (!LocalPathPolicy.IsAllowedWritePath(path))
+                return new OverlaySettingsLoadResult(CreateDefault(), false);
             if (!File.Exists(path))
             {
                 // Write the documented schema out on first run: the file is meant to be findable and
@@ -291,6 +300,7 @@ internal sealed class OverlaySettings
             settings.AnchorMode = SanitizeAnchorMode(persisted.AnchorMode);
             settings.VisibleFields = DisplayFieldRules.SanitizeVisible(
                 (DisplayField)(persisted.VisibleFields ?? (int)DefaultVisibleFields));
+            settings.CompactFields = StripFieldRules.Sanitize((StripField)(persisted.CompactFields ?? (int)StripFieldRules.Default));
             settings.SetCollapsedFields(
                 (DisplayField)(persisted.CollapsedPrimaryField ?? (int)DisplayField.Tps),
                 (DisplayField)(persisted.CollapsedSecondaryField ?? (int)DisplayField.Total));
@@ -321,12 +331,11 @@ internal sealed class OverlaySettings
                 persisted.FixedScreenX ?? 0,
                 persisted.FixedScreenY ?? 0);
 
-            // v4: lifecycle. Both fields stay as written; the first-run opt-in is applied by
-            // StartupCoordinator at launch, which is the only place that can also see the registry.
-            // An absent `startupConfigured` means "never configured", including for a v3 file being
-            // upgraded — and that is exactly the case that gets the default-on treatment once.
+            // Legacy startup preferences require fresh explicit consent in this fork.
             settings.StartWithWindows = persisted.StartWithWindows ?? false;
+            settings.PositionHotkeyEnabled = persisted.PositionHotkeyEnabled ?? false;
             settings.StartupConfigured = persisted.StartupConfigured ?? false;
+            settings.StartupOptInConfirmed = persisted.StartupOptInConfirmed ?? false;
 
             // Migration. A v2 file always wrote `positionMode`, and v2's default was FollowCodex, so
             // an explicit choice of FollowCodex is indistinguishable from never having touched it.
@@ -372,11 +381,14 @@ internal sealed class OverlaySettings
 
             // v4: lifecycle.
             StartWithWindows = StartWithWindows,
+            PositionHotkeyEnabled = PositionHotkeyEnabled,
             StartupConfigured = StartupConfigured,
+            StartupOptInConfirmed = StartupOptInConfirmed,
 
             // v1 keys, kept so an older build can still read this file.
             AnchorMode = (int)SanitizeAnchorMode((int)AnchorMode),
             VisibleFields = (int)DisplayFieldRules.SanitizeVisible(VisibleFields),
+            CompactFields = (int)StripFieldRules.Sanitize(CompactFields),
             CollapsedPrimaryField = (int)CollapsedPrimaryField,
             CollapsedSecondaryField = (int)CollapsedSecondaryField,
             ManualPlacementEnabled = ManualPlacementEnabled,
@@ -437,6 +449,7 @@ internal sealed class OverlaySettings
         var path = settingsPath ?? DefaultSettingsPath;
         try
         {
+            if (!LocalPathPolicy.IsAllowedWritePath(path)) return false;
             var directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrWhiteSpace(directory))
             {
@@ -645,6 +658,7 @@ internal static class SettingsProbe
         var path = RequireTemporaryPath(probeCase);
         if (probeCase.Json is not null)
         {
+            if (!LocalPathPolicy.IsAllowedWritePath(path)) throw new ArgumentException("Synthetic settings path must be local.");
             var directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrWhiteSpace(directory))
             {

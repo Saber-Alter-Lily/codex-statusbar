@@ -7,9 +7,9 @@
     <Nullable>enable</Nullable>
     <AssemblyName>CodexStatusbar</AssemblyName>
     <RootNamespace>CodexStatusbar</RootNamespace>
-    <Version>1.0.0-rc3</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.1.0-local.6</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.6</FileVersion>
     <Product>CodexStatusbar</Product>
     <Copyright>MIT licensed</Copyright>
     <!--
@@ -20,8 +20,8 @@
     -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Authors>soleillevant0125; CodexStatusbar contributors</Authors>
-    <Description>A read-only 3-metric Windows status strip (TPS / total tokens / cache hit) for Codex Desktop.</Description>
-    <RepositoryUrl>https://github.com/dongyue-19/codex-statusbar</RepositoryUrl>
+    <Description>Local read-only conversation usage and stage-speed monitor with a resizable Windows panel.</Description>
+    <RepositoryUrl>https://github.com/Saber-Alter-Lily/codex-statusbar</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PublishSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</PublishSingleFile>
     <SelfContained Condition="'$(RuntimeIdentifier)' != ''">true</SelfContained>

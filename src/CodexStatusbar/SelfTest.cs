@@ -68,6 +68,19 @@ internal static class SelfTest
         Section("metric strictness and formatting");
         RunMetricRules(stdout);
 
+        Section("privacy and TTFT regressions");
+        RunHardeningRules();
+
+        Section("bounded readers and recent-session isolation (synthetic files only)");
+        foreach (var check in BoundedReaderSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in RecentSessionSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in ComposerDiscoverySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in DiscoveryIpcSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in SecurityPrivacySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in PathBoundarySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in InteractionSafetySelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+        foreach (var check in MonitoringSelfTest.Evaluate()) Check(check.Name, check.Passed, true);
+
         Section("TPS state machine");
         RunStateMachine(stdout);
 
@@ -134,58 +147,43 @@ internal static class SelfTest
             OverlayRenderMetrics.Create(96, 100).TextShadowOffset == 1, true);
         Check("the hotkey is Ctrl+Alt+Shift+P", GlobalHotkey.Description, "Ctrl+Alt+Shift+P");
 
-        // Codex's own theme wins over the Windows theme, because the two routinely disagree.
-        Check("Codex theme: appearanceTheme = \"light\" is read",
-            CodexThemeSource.Parse(["appearanceTheme = \"light\"", "[desktop]"]), CodexThemeKind.Light);
-        Check("Codex theme: dark is read",
-            CodexThemeSource.Parse(["appearanceTheme = \"dark\""]), CodexThemeKind.Dark);
-        Check("Codex theme: a missing key is Unknown, never guessed",
-            CodexThemeSource.Parse(["model = \"gpt-5\""]), CodexThemeKind.Unknown);
-        Check("Codex theme: a nested key is never mistaken for the app setting",
-            CodexThemeSource.Parse(["[desktop.appearanceLightChromeTheme]", "appearanceTheme = \"dark\""]),
-            CodexThemeKind.Unknown);
-        // The real file has it under [desktop], below many other sections.
-        Check("Codex theme: a root key after several sections is still found",
-            CodexThemeSource.Parse([
-                "model = \"gpt-5\"",
-                "",
-                "[mcp_servers.node_repl]",
-                "command = \"node\"",
-                "",
-                "[desktop]",
-                "someTuning = 1",
-                "",
-                "appearanceTheme = \"light\"",
-                "",
-                "[desktop.appearanceLightChromeTheme]"
-            ]),
-            CodexThemeKind.Light);
-        Check("Codex theme: the key is desktop-scoped in the real config (~/.codex/config.toml)",
-            CodexThemeSource.Parse([
-                "[features]",
-                "x = true",
-                "[desktop]",
-                "appearanceTheme = \"light\"",
-                "[desktop.appearanceLightChromeTheme.fonts]",
-                "ui = \"Segoe UI\""
-            ]),
-            CodexThemeKind.Light);
-        Check("Codex theme: a deeper appearance sub-theme is ignored",
-            CodexThemeSource.Parse([
-                "[desktop.appearanceLightChromeTheme]",
-                "appearanceTheme = \"dark\""
-            ]),
-            CodexThemeKind.Unknown);
-        Check("Codex theme: an unknown value falls back instead of guessing",
-            CodexThemeSource.Parse(["appearanceTheme = \"solarized\""]), CodexThemeKind.Unknown);
-        Check("Codex theme: a trailing comment is tolerated",
-            CodexThemeSource.Parse(["appearanceTheme = \"light\"  # or dark"]), CodexThemeKind.Light);
-        Check("Codex theme: the real config file on this machine parses",
-            CodexThemeSource.Read(CodexThemeSource.DefaultConfigPath) != CodexThemeKind.Unknown,
-            true);
+
     }
 
-    /// <summary>Folds the whole position suite into the default gate instead of duplicating it.</summary>
+    /// <summary>Synthetic-only privacy, consent and latency regression coverage.</summary>
+    private static void RunHardeningRules()
+    {
+        var snapshot = new TokenSnapshot("PRIVATE_THREAD", "C:\\PRIVATE_PATH", 3, 1, 0, 2,
+            0, 0, 0, DateTime.UnixEpoch, Title: "PRIVATE_TITLE", TurnId: "PRIVATE_TURN",
+            Warnings: ["PRIVATE_WARNING"], Source: "PRIVATE_SOURCE");
+        var block = DebugDiagnostics.Build(snapshot);
+        Check("diagnostics drop private strings", block.Contains("PRIVATE_", StringComparison.Ordinal), false);
+        Check("TTFT missing is explicit", DebugDiagnostics.FormatTtft(null), "-- (not reported)");
+        Check("TTFT invalid is unknown", DebugDiagnostics.FormatTtft(double.NaN), "-- (not reported)");
+        Check("TTFT zero is reported, not missing", DebugDiagnostics.FormatTtft(0),
+            "0 (reported; not locally estimated)");
+        Check("detail TTFT reports units", OverlayPresentationBuilder.CreateTtftRow(123).Value, "123 ms");
+        Check("detail TTFT missing is explicit", OverlayPresentationBuilder.CreateTtftRow(null).Value, "--（未上报）");
+        var tracker = new TpsTracker();
+        tracker.BeginTurn("a", true, 0, false);
+        tracker.CompleteTurn(null, 123);
+        Check("reported TTFT retained", tracker.TtftMs == 123, true);
+        tracker.BeginTurn("b", true, 0, false);
+        Check("new turn clears old TTFT", tracker.TtftMs is null, true);
+        tracker.CompleteTurn(null, -1);
+        Check("negative TTFT rejected", tracker.TtftMs is null, true);
+        var isolatedRoot = Path.Combine(Path.GetTempPath(), "synthetic-isolated-profile", "sessions");
+        Check("isolated missing DB never falls back to default profile",
+            StateDatabase.ResolvePathForSessionsRoot(isolatedRoot),
+            Path.Combine(Path.GetDirectoryName(isolatedRoot)!, "state_5.sqlite"));
+        var legacy = OverlaySettings.ParseJson(
+            "{\"settingsVersion\":4,\"startWithWindows\":true,\"startupConfigured\":true}").Settings;
+        Check("upstream auto-enable is not consent", legacy.StartupOptInConfirmed, false);
+        legacy.StartupOptInConfirmed = true;
+        Check("explicit consent survives serialization",
+            OverlaySettings.ParseJson(legacy.Serialize()).Settings.StartupOptInConfirmed, true);
+    }
+
     private static void RunPositionModel(TextWriter stdout)
     {
         foreach (var check in PositionProbe.Evaluate())
@@ -935,9 +933,9 @@ internal static class SelfTest
 
         // --- the reconcile decision table: first-run only, then the user's choice ---
         Check(
-            "first run (never configured) registers itself",
+            "first run stays disabled without explicit opt-in",
             StartupStatus.ResolveAction(false, false, null, exe),
-            StartupRegistryAction.Enable);
+            StartupRegistryAction.None);
         Check(
             "after the user turned it off, a later launch never re-enables it",
             StartupStatus.ResolveAction(true, false, null, exe),
@@ -963,9 +961,9 @@ internal static class SelfTest
                 exe),
             StartupRegistryAction.RepairPath);
         Check(
-            "first run with an already-correct value writes nothing",
+            "first run removes an unconfirmed upstream registration",
             StartupStatus.ResolveAction(false, false, StartupManager.BuildCommand(exe), exe),
-            StartupRegistryAction.None);
+            StartupRegistryAction.Disable);
 
         // --- the attach ladder ---
         Check("the first attach attempt is immediate", LifecycleRules.DelayForAttempt(0), 0);
