@@ -168,6 +168,8 @@ internal static class DiscoveryIpcSelfTest
             "OpenAI.ChatGPT-Desktop_2p2nqsd0c76g0", null)));
         if (OperatingSystem.IsWindows())
         {
+            try { checks.Add(("Windows package identity export returns NO_PACKAGE for synthetic runner", CodexIpcServerIdentity.CurrentSyntheticProcessHasNoPackage())); }
+            catch { checks.Add(("Windows package identity export returns NO_PACKAGE for synthetic runner", false)); }
             // A random name, owned by this self-test process. No real Codex process, pipe, profile,
             // credential or message is inspected. Production authentication must reject this peer.
             try { checks.Add(("synthetic non-Codex pipe rejected before initialize bytes", RejectSyntheticPipeAsync().GetAwaiter().GetResult())); }

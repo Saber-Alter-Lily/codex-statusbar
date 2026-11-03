@@ -60,6 +60,14 @@ internal static class CodexIpcServerIdentity
         }
     }
 
+    internal static bool CurrentSyntheticProcessHasNoPackage()
+    {
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        var length = 0;
+        // APPMODEL_ERROR_NO_PACKAGE. Do not mask a missing export as a successful rejection test.
+        return GetPackageFamilyName(process.SafeHandle, ref length, null) == 15700;
+    }
+
     private static UnauthorizedAccessException Rejected() =>
         new("Codex IPC server identity could not be verified; live IPC routing is disabled.");
 

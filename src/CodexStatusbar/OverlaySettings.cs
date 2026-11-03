@@ -654,7 +654,7 @@ internal static class SettingsProbe
         var path = RequireTemporaryPath(probeCase);
         if (probeCase.Json is not null)
         {
-            if (!LocalPathPolicy.IsAllowedWritePath(path)) return false;
+            if (!LocalPathPolicy.IsAllowedWritePath(path)) throw new ArgumentException("Synthetic settings path must be local.");
             var directory = Path.GetDirectoryName(path);
             if (!string.IsNullOrWhiteSpace(directory))
             {
